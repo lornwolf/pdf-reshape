@@ -1,0 +1,1094 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""扫描书籍 PDF 整形工具：纠正页面倾斜，并把版心（文字区域）移到页面正中。
+
+用法:
+    python pdf_reshape.py input.pdf                 # 输出 input（校正版）.pdf
+    python pdf_reshape.py input.pdf -o out.pdf
+    python pdf_reshape.py input.pdf --pages 1-20    # 只处理部分页（试效果用）
+    python pdf_reshape.py input.pdf --clean-margin  # 顺便把版心外的黑边/阴影涂成纸色
+
+处理分两遍:
+    第 1 遍  分析每页的倾斜角度和版心位置，统计全书的标准版心尺寸
+    第 2 遍  对每页做一次「旋转 + 平移」的仿射变换（只重采样一次），写入新 PDF
+"""
+import argparse
+import bisect
+import math
+import struct
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+import cv2
+import fitz  # PyMuPDF
+import numpy as np
+
+ANALYSIS_VERSION = 3        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
+ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
+FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
+OVERSIZE_TOLERANCE = 0.025  # 版心比标准版心大出这么多，才怀疑它是被空白处的杂质撑大的
+EDGE_MATCH_TOLERANCE = 0.03  # 半页的版心边缘与同类页相差在此以内，才认为是同一条版心边
+FLUSH_RATIO = 0.35          # 略窄的页：一边离标准版心的距离不到另一边的这个比例，就认为这一边是对齐的、缩进全在另一边
+NARROW_TOLERANCE = 0.12     # 版心只比标准版心小这么多以内时，可以放心地单独居中（误差不超过它的一半）
+FULL_BLEED_RATIO = 0.95     # 内容占满页面超过这个比例时，视为整页图片，不处理
+
+
+@dataclass
+class PageInfo:
+    index: int
+    mode: str = "copy"          # copy: 原样复制 / native: 取内嵌原图 / render: 渲染成图
+    xref: int = 0
+    bilevel: bool = False       # 原图是否为黑白二值图
+    dpi: float = 0.0            # 图像相对于页面尺寸的分辨率
+    angle: float = 0.0          # 需要施加的旋转角度（度，逆时针为正）
+    vertical: bool = False      # 是否竖排（倾斜检测时列方向的投影更有规律）
+    bbox: tuple | None = None   # 旋转后的版心 (x0, y0, x1, y1)，按图像宽高归一化到 0~1
+    core_bbox: tuple | None = None  # 只算成块内容（文字行、插图）的版心；见 effective_boxes
+    outliers: list | None = None    # 伸出核心版心之外的小块 [(x0, y0, x1, y1), ...]：页码、序号，也可能是污渍
+    dense_bbox: tuple | None = None  # 按墨迹密度求出的正文范围 (x0, y0, x1, y1)；见 dense_extent
+    scan_rect: tuple = (0.0, 0.0, 1.0, 1.0)  # 扫描图在页面中的范围（归一化）
+    # 以下两项每次 load_page_image 时重新填写，不依赖保存下来的分析结果
+    jpeg_block: int = 0         # 原图是 JPEG 时，它的编码块大小（灰度 8、彩色 16）；不是 JPEG 为 0
+    grid: tuple = (0, 0)        # 原图左上角在整页画布中的像素位置（JPEG 块网格的原点）
+    note: str = ""
+
+
+@dataclass
+class Options:
+    deskew: bool = True         # 倾斜校正
+    center: bool = True         # 版心居中
+    per_page: bool = False      # 每页各自居中（不参照全书标准版心）
+    clean_margin: bool = False  # 把版心以外涂成纸色
+    upscale: bool = False       # 黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）
+    max_angle: float = 5.0      # 倾斜检测范围 ±度
+    min_angle: float = 0.1      # 小于此角度不旋转
+    dpi: int = 300              # 无法直接取原图的页面的渲染 DPI
+    quality: int = 90           # JPEG 质量
+
+
+def default_output_path(input_path):
+    """默认的输出文件：和原文件同目录，文件名后加「（校正版）」。"""
+    input_path = Path(input_path)
+    return input_path.with_name(input_path.stem + "（校正版）.pdf")
+
+
+class Cancelled(Exception):
+    pass
+
+
+# ---------------------------------------------------------------- 取得页面图像
+
+def classify_page(doc, page):
+    """判断页面的取图方式。返回 (mode, xref)。"""
+    images = page.get_images(full=True)
+    if not images:
+        return "copy", 0            # 没有图像＝不是扫描页，原样保留
+    if len(images) == 1 and page.rotation == 0:
+        item = images[0]
+        xref, smask = item[0], item[1]
+        try:
+            bbox, m = page.get_image_bbox(item, transform=True)
+        except Exception:
+            return "render", 0
+        covers = abs(bbox & page.rect) >= 0.5 * abs(page.rect)
+        upright = m.a > 0 and m.d > 0 and abs(m.b) < 1e-3 and abs(m.c) < 1e-3
+        if covers and upright and smask == 0:
+            return "native", xref   # 整页就是一张图：直接取原图，避免渲染损失
+    return "render", 0
+
+
+def place_on_page(img, bbox, page_rect, bilevel):
+    """把内嵌图按它在页面中的位置贴到一张整页大小的画布上（保持原图分辨率）。
+
+    有的 PDF 扫描图并不占满整页（比如居中放在 A4 页面里）。统一成整页画布后，
+    后面的处理就不用区分这两种情况。返回 (画布, 扫描图在画布中的归一化范围, 原图左上角的像素位置)。
+    """
+    h, w = img.shape[:2]
+    tol = 0.005 * max(page_rect.width, page_rect.height)
+    if all(abs(a - b) <= tol for a, b in zip(bbox, page_rect)):
+        return img, (0.0, 0.0, 1.0, 1.0), (0, 0)
+    sx, sy = w / bbox.width, h / bbox.height
+    cw, ch = round(page_rect.width * sx), round(page_rect.height * sy)
+    ox, oy = round((bbox.x0 - page_rect.x0) * sx), round((bbox.y0 - page_rect.y0) * sy)
+    if bilevel:
+        paper = 255
+    else:
+        paper = np.median(img[::8, ::8].reshape(-1, 1 if img.ndim == 2 else 3), axis=0)
+    canvas = np.empty((ch, cw) + img.shape[2:], dtype=np.uint8)
+    canvas[:] = paper
+    x0, y0, x1, y1 = max(ox, 0), max(oy, 0), min(ox + w, cw), min(oy + h, ch)
+    canvas[y0:y1, x0:x1] = img[y0 - oy:y1 - oy, x0 - ox:x1 - ox]
+    return canvas, (x0 / cw, y0 / ch, x1 / cw, y1 / ch), (ox, oy)
+
+
+def pixmap_to_array(pix):
+    """fitz.Pixmap → numpy 数组（灰度为 HxW，彩色为 HxWx3 的 BGR）。"""
+    if pix.colorspace is None or pix.n - pix.alpha > 3:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    if pix.alpha:
+        pix = fitz.Pixmap(pix, 0)
+    n = pix.n
+    buf = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    arr = buf[:, : pix.width * n].reshape(pix.height, pix.width, n)
+    if n == 1:
+        return arr[:, :, 0].copy()
+    if n == 2:                       # 灰度以外的双通道极少见，取第一通道
+        return arr[:, :, 0].copy()
+    return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+
+
+def load_native_image(doc, page, xref, bbox):
+    """取页面里内嵌的原图。
+
+    有的扫描 PDF 把黑白页存成「图像蒙版」（ImageMask）：没有色彩空间，只记录哪些点要上色，
+    上什么颜色、0 和 1 谁代表上色都由页面决定，不能直接当灰度图用（对它做色彩空间转换会报
+    "source colorspace must not be None"）。这种图改为按它自身的分辨率把所在区域渲染出来，
+    像素和原图一一对应，颜色由 PDF 引擎按页面的设定处理；再二值化去掉渲染的抗锯齿灰边。
+    """
+    pix = fitz.Pixmap(doc, xref)
+    if pix.colorspace is not None:
+        return pixmap_to_array(pix)
+    matrix = fitz.Matrix(pix.width / bbox.width, pix.height / bbox.height)
+    rendered = pixmap_to_array(page.get_pixmap(matrix=matrix, clip=bbox, colorspace=fitz.csGRAY, alpha=False))
+    if rendered.shape[:2] != (pix.height, pix.width):       # 取整可能差 1 个像素
+        rendered = cv2.resize(rendered, (pix.width, pix.height), interpolation=cv2.INTER_NEAREST)
+    return cv2.threshold(rendered, 127, 255, cv2.THRESH_BINARY)[1]
+
+
+def load_page_image(doc, page, info, dpi):
+    if info.mode == "native":
+        item = next(it for it in page.get_images(full=True) if it[0] == info.xref)
+        bbox = page.get_image_bbox(item)
+        img = load_native_image(doc, page, info.xref, bbox)
+    else:
+        img = pixmap_to_array(page.get_pixmap(dpi=dpi))
+    # 三通道但实际是灰度的页面，转成单通道以减小输出体积
+    if img.ndim == 3:
+        small = img[::8, ::8].astype(np.int16)
+        if np.abs(small[:, :, 0] - small[:, :, 1]).max() < 10 and \
+           np.abs(small[:, :, 1] - small[:, :, 2]).max() < 10:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if info.mode == "native":
+        info.dpi = img.shape[1] / bbox.width * 72
+        img, info.scan_rect, info.grid = place_on_page(img, bbox, page.rect, info.bilevel)
+        is_jpeg = "DCTDecode" in doc.xref_get_key(info.xref, "Filter")[1]
+        info.jpeg_block = (8 if img.ndim == 2 else 16) if is_jpeg else 0
+    else:
+        info.dpi, info.jpeg_block, info.grid = dpi, 0, (0, 0)
+    return img
+
+
+# ---------------------------------------------------------------- 分析
+
+def to_gray(img):
+    return img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def make_ink_mask(gray_small, scan_rect=(0.0, 0.0, 1.0, 1.0)):
+    """二值化得到「墨迹」掩码，并清掉不属于版面内容的东西。
+
+    1. 与扫描图边缘相连的成分（扫描黑边、书脊阴影）。注意是扫描图的边缘，
+       不是页面的边缘——扫描图可能只占页面的一部分。
+    2. 细长的线（纸张边缘的阴影线等）。标题的装饰线也会被去掉，但它本来就在
+       文字范围之内，不影响版心的判定。
+    3. 远离其他内容的孤立小污点。
+    """
+    _, ink = cv2.threshold(gray_small, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    h, w = ink.shape
+
+    # 1. 贴边成分（边缘 3 像素以内都算贴边，容许坐标取整的误差）
+    x0, y0 = int(np.floor(scan_rect[0] * w)), int(np.floor(scan_rect[1] * h))
+    x1, y1 = int(np.ceil(scan_rect[2] * w)), int(np.ceil(scan_rect[3] * h))
+    ink[:y0] = 0; ink[y1:] = 0; ink[:, :x0] = 0; ink[:, x1:] = 0
+    scan = ink[y0:y1, x0:x1]
+    n, labels, _, _ = cv2.connectedComponentsWithStats(scan, connectivity=8)
+    m = 3
+    border = np.unique(np.concatenate([labels[:m].ravel(), labels[-m:].ravel(),
+                                       labels[:, :m].ravel(), labels[:, -m:].ravel()]))
+    remove = np.zeros(n, dtype=bool)
+    remove[border] = True
+    remove[0] = False
+    scan[remove[labels]] = 0
+
+    # 2. 细长线：先膨胀把断断续续的线段连起来，再按最小外接矩形的「粗细/长度」判断
+    k = 7
+    merged = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (k, k)))
+    contours, _ = cv2.findContours(merged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    erase = np.zeros_like(ink)
+    blobs = []
+    for c in contours:
+        (_, _), (rw, rh), _ = cv2.minAreaRect(c)
+        thick, length = min(rw, rh), max(rw, rh)
+        if thick <= k + 4 and length >= 0.05 * max(h, w):
+            cv2.drawContours(erase, [c], -1, 255, cv2.FILLED)
+        else:
+            blobs.append(c)
+
+    # 3. 边缘地带的小块：整个落在扫描图边缘 3% 以内的小东西，是黑边的残留或边缘污渍
+    zx, zy = 0.03 * (x1 - x0), 0.03 * (y1 - y0)
+    small_size = 0.025 * max(h, w)
+    inner = []
+    for c in blobs:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        side_zone = bx + bw <= x0 + zx or bx >= x1 - zx     # 左右边缘：正文不可能整个挤在这里
+        end_zone = by + bh <= y0 + zy or by >= y1 - zy      # 上下边缘：可能有页眉页码，只去细线和小块
+        thin = min(cv2.minAreaRect(c)[1]) <= k + 4
+        if side_zone or (end_zone and (thin or max(bw, bh) - k <= small_size)):
+            cv2.drawContours(erase, [c], -1, 255, cv2.FILLED)
+        else:
+            inner.append(c)
+    blobs = inner
+
+    # 4. 孤立小污点：自身很小，并且周围一圈之内没有别的内容
+    reach = int(0.04 * max(h, w))
+    kept = np.zeros_like(ink)
+    cv2.drawContours(kept, blobs, -1, 255, cv2.FILLED)
+    for c in blobs:
+        bx, by, bw, bh = cv2.boundingRect(c)
+        if max(bw, bh) > k + 10:
+            continue
+        around = kept[max(by - reach, 0):by + bh + reach, max(bx - reach, 0):bx + bw + reach]
+        own = cv2.countNonZero(kept[by:by + bh, bx:bx + bw])
+        if cv2.countNonZero(around) - own == 0:
+            cv2.drawContours(erase, [c], -1, 255, cv2.FILLED)
+    ink[erase > 0] = 0
+    return ink
+
+
+def rotate(img, angle, border_value=0, flags=cv2.INTER_LINEAR):
+    h, w = img.shape[:2]
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    return cv2.warpAffine(img, m, (w, h), flags=flags,
+                          borderMode=cv2.BORDER_CONSTANT, borderValue=border_value)
+
+
+def detect_skew(ink, max_angle):
+    """投影轮廓法：文字行完全水平（竖排则列完全垂直）时，投影的起伏最剧烈。
+
+    同时计算行方向和列方向的得分，取峰值更尖锐的一方，因此横排、竖排都适用。
+    返回 (角度, 置信度, 是否竖排)。
+    """
+    def scores(angle):
+        r = rotate(ink, angle, flags=cv2.INTER_NEAREST)
+        rows = r.sum(axis=1, dtype=np.float64)
+        cols = r.sum(axis=0, dtype=np.float64)
+        return np.sum(np.diff(rows) ** 2), np.sum(np.diff(cols) ** 2)
+
+    def search(angles):
+        s = np.array([scores(a) for a in angles])       # 形状 (N, 2)
+        sharp = s.max(axis=0) / (np.median(s, axis=0) + 1e-9)
+        axis = int(np.argmax(sharp))
+        return angles[int(np.argmax(s[:, axis]))], sharp[axis], axis
+
+    coarse, conf, axis = search(np.arange(-max_angle, max_angle + 1e-6, 0.5))
+    fine, _, _ = search(np.arange(coarse - 0.5, coarse + 0.5 + 1e-6, 0.05))
+    return float(fine), float(conf), axis == 1
+
+
+def detect_content_bbox(ink):
+    """求版心包围盒（归一化坐标）。返回 (版心, 核心版心, 核心之外的小块)，没有内容时版心为 None。
+
+    先膨胀把文字连成块，再丢掉零星噪点。「版心」包含剩下的全部内容；「核心版心」只算成块的
+    内容——膨胀后够长（超过页面长边的 3%）而且够粗（超过 1.2%）的块（文字行、插图）。伸出核心版心之外的小块单独列出来：
+    它们可能是页码、目录的序号，也可能是空白处的污渍，单看一页分不清，留给 effective_boxes
+    对照全书的标准版心去判断。
+    """
+    h, w = ink.shape
+    merged = cv2.dilate(ink, cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(merged, connectivity=8)
+    pad = 3  # 抵消膨胀造成的外扩
+
+    def box_of(i):
+        x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
+        return (round(float((x + pad) / w), 4), round(float((y + pad) / h), 4),
+                round(float((x + stats[i, cv2.CC_STAT_WIDTH] - pad) / w), 4),
+                round(float((y + stats[i, cv2.CC_STAT_HEIGHT] - pad) / h), 4))
+
+    def union(boxes):
+        if not boxes:
+            return None
+        a = np.array(boxes)
+        return (float(a[:, 0].min()), float(a[:, 1].min()), float(a[:, 2].max()), float(a[:, 3].max()))
+
+    keep = [i for i in range(1, n) if stats[i, cv2.CC_STAT_AREA] >= 150]
+    # 成块：够长，而且够粗。只长不粗的是线段（纸边阴影的残段等），文字行膨胀后至少有 20 像素高
+    big, thick = 0.03 * max(h, w), 0.012 * max(h, w)
+    is_core = {i: max(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) > big
+               and min(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) > thick for i in keep}
+    full = union([box_of(i) for i in keep])
+    core = union([box_of(i) for i in keep if is_core[i]])
+    outliers = []
+    if core:
+        for i in keep:
+            b = box_of(i)
+            if not is_core[i] and (b[0] < core[0] or b[1] < core[1] or b[2] > core[2] or b[3] > core[3]):
+                outliers.append(b)
+    return full, core, outliers
+
+
+DENSE_RATIO = 0.08          # 覆盖某一列的文字行数不到全页行数的这个比例（至少要 3 行），这一列就不算正文
+
+
+def dense_extent(ink):
+    """求正文在水平方向上的范围（归一化），求不出来返回 None。要竖直方向的就传 ink.T。
+
+    做法是数「每一列被多少行文字覆盖」：先按行投影把页面切成一行一行，再看每一行占了哪些列。
+    正文的列被几十行覆盖；挂在正文外侧空白里的页码、页眉各占一行，空白处的污渍也只碰到一两行。
+    不能比墨迹的多少——有的页码带一块实心的花饰，那几列的墨迹并不比正文少（试过，分不开）。
+
+    只适合沿文字行的方向用：在行堆叠的方向上没有这种「叠了很多行」的性质，段落最后一行可能
+    只有两三个字，和页码分不开，硬用会让版心的下边随页忽上忽下。
+    """
+    h, w = ink.shape
+    # 哪些行属于文字行：墨迹要够多。只看「有没有墨迹」不行——页边只要有一道贯穿上下的细线或
+    # 一串污点，每一行就都「有墨迹」，整页连成一行
+    amount = ink.sum(axis=1) / 255.0
+    if not amount.any():
+        return None
+    rows = np.flatnonzero(amount >= 0.15 * np.median(amount[amount > 0]))
+    if not len(rows):
+        return None
+    # 连续有墨迹的行归为一行文字；中间断 2 个像素以内的不算断（注音、标点会让行投影有细缝）
+    breaks = np.flatnonzero(np.diff(rows) > 3)
+    runs = [(rows[a], rows[b] + 1) for a, b in zip(np.r_[0, breaks + 1], np.r_[breaks, len(rows) - 1])]
+    runs = [(a, b) for a, b in runs if b - a >= 4]                  # 不到 4 个像素高的是噪点，不是一行字
+    if len(runs) < 4:                                               # 行数太少，「叠了很多行」无从谈起
+        return None
+    k = max(5, int(0.015 * w))                                      # 约一个字宽：抹平字与字之间的空隙
+    kernel = np.ones(k)
+    cover, exact = np.zeros(w), np.zeros(w)
+    for a, b in runs:
+        occupied = ink[a:b].any(axis=0)
+        exact += occupied
+        cover += np.convolve(occupied.astype(float), kernel, mode="same") > 0
+    # 至少 3 行：页眉和页码常常挂在同一侧（右页的右上角和右下角），那几列会被 2 行覆盖
+    dense = np.flatnonzero(cover >= max(3, DENSE_RATIO * len(runs)))
+    if not len(dense):
+        return None
+    # 抹平空隙的同时也把边缘向外抹开了半个字：回到没抹过的覆盖数上，取这一带里第一个和最后一个
+    # 「至少被 2 行盖住」的列。不能只看有没有墨迹——页码的花饰可能就贴在正文旁边不到一个字宽的地方
+    cols = exact >= 2
+    lo_zone = np.flatnonzero(cols[max(dense[0] - k, 0):dense[0] + k + 1])
+    hi_zone = np.flatnonzero(cols[max(dense[-1] - k, 0):dense[-1] + k + 1])
+    lo = max(dense[0] - k, 0) + lo_zone[0] if len(lo_zone) else dense[0]
+    hi = max(dense[-1] - k, 0) + hi_zone[-1] + 1 if len(hi_zone) else dense[-1] + 1
+    return float(lo / w), float(hi / w)
+
+
+def analyze(img, info, max_angle):
+    gray = to_gray(img)
+    scale = ANALYSIS_LONG_SIDE / max(gray.shape)
+    small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) \
+        if scale < 1 else gray
+    ink = make_ink_mask(small, info.scan_rect)
+    if cv2.countNonZero(ink) < 0.001 * ink.size:
+        info.mode, info.note = "copy", "空白页或整页图片"
+        return
+    angle, conf, info.vertical = detect_skew(ink, max_angle)
+    if conf < 1.2:
+        angle, info.note = 0.0, "倾斜不明确，不旋转"
+    info.angle = angle
+    ink = rotate(ink, angle, flags=cv2.INTER_NEAREST)
+    bbox, core_bbox, outliers = detect_content_bbox(ink)
+    if bbox is None:
+        info.mode, info.note = "copy", "未检测到版心"
+        return
+    if bbox[2] - bbox[0] > FULL_BLEED_RATIO and bbox[3] - bbox[1] > FULL_BLEED_RATIO:
+        info.mode, info.note = "copy", "内容占满整页"
+        return
+    info.bbox, info.core_bbox, info.outliers = bbox, core_bbox, outliers
+    # 两个方向的密度范围都存下来：哪个方向是文字行的方向，要等全书分析完才知道（单页会误判）
+    # 两个方向各求各的，求不出来的那个方向就用版心本身：横排书在竖直方向上本来就求不出来
+    # （各列的字上下连成一片，分不出「行」），不能因此把水平方向的结果也丢掉
+    xs = dense_extent(ink) or (bbox[0], bbox[2])
+    ys = dense_extent(ink.T) or (bbox[1], bbox[3])
+    info.dense_bbox = (xs[0], ys[0], xs[1], ys[1])
+
+
+# ---------------------------------------------------------------- 对齐量的计算
+
+def _reference_of(boxes, infos):
+    arr = np.array([b for _, b in boxes])
+    ref = {"ext": (np.median(arr[:, 2] - arr[:, 0]), np.median(arr[:, 3] - arr[:, 1])),
+           "vertical": sum(p.vertical for p in infos if p.bbox) * 2 > len(boxes)}
+    for parity in (0, 1):
+        sub = np.array([b for i, b in boxes if i % 2 == parity])
+        ref[parity] = np.median(sub if len(sub) >= 4 else arr, axis=0)
+    return ref
+
+
+def _peel(core_lo, core_hi, spans, limit):
+    """一个方向上：从核心版心加上全部小块出发，由外向内剥掉小块，直到范围不超过 limit。
+
+    每次剥最外侧的那个；两侧都有时，剥「离里面的内容更远」的一侧——空白处的污渍是孤零零的，
+    和内容之间隔着一大段空白；页码、目录的序号紧挨着正文，间隔很小，会留到最后。
+    """
+    los = sorted((sp for sp in spans if sp[0] < core_lo), key=lambda sp: sp[0])
+    his = sorted((sp for sp in spans if sp[1] > core_hi), key=lambda sp: -sp[1])
+    while True:
+        lo = min([core_lo] + [sp[0] for sp in los])
+        hi = max([core_hi] + [sp[1] for sp in his])
+        if hi - lo <= limit or not (los or his):
+            return lo, hi
+        gap_lo = min([core_lo] + [sp[0] for sp in los[1:]]) - los[0][0] if los else -1.0
+        gap_hi = his[0][1] - max([core_hi] + [sp[1] for sp in his[1:]]) if his else -1.0
+        (los if gap_lo >= gap_hi else his).pop(0)
+
+
+def effective_boxes(infos, ext):
+    """决定每一页实际采用的版心。ext 是全书标准版心的 (宽, 高)。
+
+    空白处的小污渍（一小段竖线、一个墨点）会把版心撑大：框还是居中的，文字却偏到了一边。
+    单看一页分不清它是污渍还是页码——大小差不多；但和全书的标准版心一比就清楚了：
+    版心明显比标准大，就是被杂质撑大的，把最外侧、最孤立的小块逐个剥掉，剥到大小正常为止。
+    带页码的版心本来就和标准一样大，不会被动到。
+    """
+    result = {}
+    for p in infos:
+        if not p.bbox:
+            continue
+        box = list(p.bbox)
+        if p.core_bbox and p.outliers:
+            for lo, hi, med in ((0, 2, ext[0]), (1, 3, ext[1])):
+                if box[hi] - box[lo] > med + OVERSIZE_TOLERANCE:
+                    spans = [(b[lo], b[hi]) for b in p.outliers]
+                    box[lo], box[hi] = _peel(p.core_bbox[lo], p.core_bbox[hi], spans, med + OVERSIZE_TOLERANCE)
+        result[p.index] = tuple(box)
+    return result
+
+
+def compute_reference(infos):
+    """统计标准版心：全书版心宽高的中位数，以及奇偶页各自的版心边缘位置中位数。
+
+    每一页有两个版心：
+    - ref["content"]：这一页的全部内容，剔掉了空白处的杂质（见 effective_boxes）。涂白页边时用它，
+      免得把挂在正文外面的页码也涂掉。
+    - ref["boxes"]：对齐用的版心。行堆叠的方向和上面一样；**沿文字行的方向换成按密度求出的正文
+      范围**（见 dense_extent）。有的书把页码挂在正文外侧的空白里（左页在左下角、右页在右下角），
+      带页码的版心比正文宽一截：拿它居中，正文就会一页偏左一页偏右，没有页码的章首页还会被
+      当成「窄了」而贴到一边去。对齐要看的是正文，不是页码。
+    标准版心的统计用的是对齐用的版心。
+    """
+    raw = [(p.index, p.bbox) for p in infos if p.bbox]
+    if not raw:
+        return None
+    first = _reference_of(raw, infos)
+    content = effective_boxes(infos, first["ext"])
+    lo, hi = (1, 3) if first["vertical"] else (0, 2)        # 文字行的方向：横排书是水平方向
+    boxes = {}
+    for p in infos:
+        if p.index in content:
+            box = list(content[p.index])
+            if p.dense_bbox:
+                box[lo], box[hi] = p.dense_bbox[lo], p.dense_bbox[hi]
+            boxes[p.index] = tuple(box)
+    # 按密度求出的正文范围只用来**去掉伸到正文外面的东西**（外挂的页码、页眉、污渍），也就是只在
+    # 全部内容比标准的正文宽时才用。内容没有超宽的页直接用全部内容：整行的文字只有寥寥几行的页
+    # （诗歌、对话、字表、目录），整行所在的列达不到「叠了很多行」的门槛，求出来的范围会偏窄
+    standard = _reference_of(sorted(boxes.items()), infos)["ext"][0 if lo == 0 else 1]
+    for index, whole in content.items():
+        if whole[hi] - whole[lo] <= standard + FULL_PAGE_TOLERANCE:
+            box = list(boxes[index])
+            box[lo], box[hi] = whole[lo], whole[hi]
+            boxes[index] = tuple(box)
+    ref = _reference_of(sorted(boxes.items()), infos)
+    ref["boxes"], ref["content"] = boxes, content
+    return ref
+
+
+def page_box(info, ref):
+    """这一页对齐用的版心。"""
+    return ref["boxes"].get(info.index, info.bbox) if ref else info.bbox
+
+
+def content_box(info, ref):
+    """这一页全部内容的范围（含挂在正文外面的页码，不含空白处的杂质）。"""
+    return ref["content"].get(info.index, info.bbox) if ref else info.bbox
+
+
+def axis_shift(lo, hi, med_ext, edges, along_lines):
+    """单个方向上的平移量（归一化）。
+
+    edges 是 [(本页所属奇偶类的版心两边位置中位数), (另一类的)]；
+    along_lines 表示这个方向是不是沿着文字行的方向（横排书的水平方向）。
+
+    1. 整页（版心和标准版心一样大）：直接居中。
+    2. 沿文字行的方向上只是略窄（目录、诗歌、整体缩进的段落）：看它窄在哪一边。通常是一边和
+       正文对齐、缩进全在另一边——那就把对齐的那一边贴齐标准版心，缩进原样保留，不能居中
+       （居中会把缩进平摊到两边，这一页就和前后页错开了）。两边缩得差不多的才是居中排版的
+       内容，直接居中。扫描位置的抖动一般只有 1% 多，比缩进量小得多，所以分得清。
+    3. 半页（章末、章首、没有页眉的页等）：直接居中会让文字偏离它该在的位置。如果它
+       有一边本来就和标准版心的边缘基本重合（章末页的上边、章首页的下边），就把这一边
+       贴齐标准版心。先和本页所属的奇偶类比，对不上再和另一类比——页序的奇偶不一定
+       可靠：前置部分和正文之间多一页或少一页，左右页的对应关系就反过来了。
+    4. 和两类都对不上（前言、落款等版式特殊的页），无从判断它的版心在哪里：只是略小的
+       就直接居中；小很多的只按全书的平均偏移量移动（取两类的平均，不押注它属于哪一类）。
+    """
+    ext = hi - lo
+    centered = (1 - ext) / 2 - lo
+    if ext >= med_ext - FULL_PAGE_TOLERANCE:
+        return centered
+    slightly_smaller = ext >= med_ext - NARROW_TOLERANCE
+    std_lo = (1 - med_ext) / 2
+    std_hi = std_lo + med_ext
+    if along_lines and slightly_smaller:
+        # 取两边里更吻合的那一类来比（页序的奇偶不可靠）
+        d_lo, d_hi = min(((abs(lo - e[0]), abs(hi - e[1])) for e in edges), key=min)
+        if min(d_lo, d_hi) <= FLUSH_RATIO * max(d_lo, d_hi):
+            return std_lo - lo if d_lo <= d_hi else std_hi - hi
+        return centered
+    for med_lo, med_hi in edges:
+        d_lo, d_hi = abs(lo - med_lo), abs(hi - med_hi)
+        if min(d_lo, d_hi) <= EDGE_MATCH_TOLERANCE:
+            return std_lo - lo if d_lo <= d_hi else std_hi - hi
+    if slightly_smaller:
+        return centered
+    return std_lo - sum(e[0] for e in edges) / len(edges)
+
+
+def compute_shift(info, ref, per_page):
+    x0, y0, x1, y1 = page_box(info, ref)
+    if per_page or ref is None:
+        return (1 - (x1 - x0)) / 2 - x0, (1 - (y1 - y0)) / 2 - y0
+    own, other = ref[info.index % 2], ref[1 - info.index % 2]
+    vertical = ref["vertical"]      # 按全书多数页的排版方向，不看单页（单页可能误判）
+    return (axis_shift(x0, x1, ref["ext"][0], [(own[0], own[2]), (other[0], other[2])], not vertical),
+            axis_shift(y0, y1, ref["ext"][1], [(own[1], own[3]), (other[1], other[3])], vertical))
+
+
+# ---------------------------------------------------------------- 输出
+
+def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None):
+    """对整页图像做「旋转 + 平移」。scale > 1 时同时放大输出（见 Options.upscale）。
+
+    不需要旋转的页只做整像素平移、不插值，像素原样搬运，完全无损。
+
+    原图是 JPEG 时，平移量还要凑成编码块（8 或 16 像素）的整数倍，让原图的块网格和输出的块
+    网格重合：这样重新压缩几乎不再损失（实测 PSNR 从 34 dB 提高到 42 dB），文件也小三成。
+    代价是居中的精度从 1 像素变成半个块，约占页宽的 0.3%，看不出来。
+    """
+    h, w = img.shape[:2]
+    dx, dy = shift[0] * w, shift[1] * h
+    bg = np.median(img[::8, ::8].reshape(-1, 1 if img.ndim == 2 else 3), axis=0)
+    bg = tuple(float(v) for v in bg)
+    if angle == 0.0:
+        scale, interp = 1, cv2.INTER_NEAREST
+        dx, dy = round(dx), round(dy)
+        if info.jpeg_block:
+            b, (gx, gy) = info.jpeg_block, info.grid
+            dx = round((dx + gx) / b) * b - gx
+            dy = round((dy + gy) / b) * b - gy
+    else:
+        interp = cv2.INTER_CUBIC
+    m = cv2.getRotationMatrix2D((w / 2, h / 2), angle, scale)
+    m[0, 2] += (scale - 1) * w / 2 + scale * dx
+    m[1, 2] += (scale - 1) * h / 2 + scale * dy
+    w, h = w * scale, h * scale
+    out = cv2.warpAffine(img, m, (w, h), flags=interp,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
+    if clean_margin:
+        pad = 0.02
+        bbox = bbox or info.bbox            # 传进来的是全部内容的范围（content_box）：含外挂的页码，不含杂质
+        x0 = max(int((bbox[0] + shift[0] - pad) * w), 0)
+        y0 = max(int((bbox[1] + shift[1] - pad) * h), 0)
+        x1 = min(int((bbox[2] + shift[0] + pad) * w), w)
+        y1 = min(int((bbox[3] + shift[1] + pad) * h), h)
+        mask = np.ones((h, w), dtype=bool)
+        mask[y0:y1, x0:x1] = False
+        out[mask] = bg if img.ndim == 3 else bg[0]
+    return out
+
+
+def encode_image(img, bilevel, quality):
+    if bilevel:
+        # 原图是黑白二值：重新二值化后存成 1bit PNG，保持锐利且体积小
+        _, bw = cv2.threshold(to_gray(img), 127, 255, cv2.THRESH_BINARY)
+        ok, buf = cv2.imencode(".png", bw, [cv2.IMWRITE_PNG_BILEVEL, 1])
+    else:
+        # OPTIMIZE: 按图像内容生成哈夫曼表，画质不变、体积小 5～10%
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality, cv2.IMWRITE_JPEG_OPTIMIZE, 1])
+    if not ok:
+        raise RuntimeError("图像编码失败")
+    return buf.tobytes()
+
+
+# ---------------------------------------------------------------- 主流程
+
+def analyze_page(doc, index, opts):
+    """第 1 遍的单页处理：判定取图方式，检测倾斜角度和版心。"""
+    page = doc[index]
+    info = PageInfo(index=index)
+    info.mode, info.xref = classify_page(doc, page)
+    if info.mode == "copy":
+        info.note = "非扫描页"
+        return info
+    if info.mode == "native":
+        info.bilevel = doc.extract_image(info.xref).get("bpc") == 1
+    analyze(load_page_image(doc, page, info, opts.dpi), info, opts.max_angle)
+    return info
+
+
+def analyze_document(doc, indices, opts, progress=None, cancelled=None):
+    infos = []
+    for k, i in enumerate(indices, 1):
+        if cancelled and cancelled():
+            raise Cancelled
+        try:
+            infos.append(analyze_page(doc, i, opts))
+        except Exception as e:              # 一页读不了不该让整本书失败：这一页原样保留，其余照常
+            infos.append(PageInfo(index=i, mode="copy", note=f"无法读取，原样保留（{type(e).__name__}: {e}）"))
+        if progress:
+            progress(k, len(indices))
+    return infos
+
+
+ANGLE_STEPS = (0.1, 0.2, 0.3, 0.5, 1.0)
+
+
+# JPEG 标准亮度量化表（IJG / libjpeg，质量 50）。OpenCV 编码用的就是它按质量缩放后的表
+_STD_LUMA = np.array([
+    16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56,
+    14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92,
+    49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99], dtype=float)
+_ZIGZAG = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6,
+           7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31,
+           39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+
+
+def jpeg_quality_of(data):
+    """从 JPEG 数据的亮度量化表反推它大致相当于 libjpeg 的哪一档质量（1~100）。读不出来返回 None。
+
+    JPEG 文件里并不记录"质量"这个数，只有量化表；拿它和标准表比出缩放倍数，再按 libjpeg 的
+    公式换算回质量。扫描仪、Adobe 等用的不是标准表，得到的只是一个相当值，做建议够用了。
+    """
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        marker = data[i + 1]
+        if marker == 0xDA:                      # 图像数据开始，后面不会再有量化表
+            break
+        length = struct.unpack(">H", data[i + 2:i + 4])[0]
+        if marker == 0xDB:
+            j = i + 4
+            while j < i + 2 + length:
+                precision, table_id = data[j] >> 4, data[j] & 15
+                n = 128 if precision else 64
+                if table_id == 0:
+                    values = np.frombuffer(data[j + 1:j + 1 + n], dtype=">u2" if precision else np.uint8)
+                    table = np.zeros(64)
+                    table[_ZIGZAG] = values
+                    scale = float(np.mean(100.0 * table / _STD_LUMA))
+                    return (200 - scale) / 2 if scale <= 100 else 5000 / scale
+                j += 1 + n
+        i += 2 + length
+    return None
+
+
+def source_profile(doc, infos, samples=15):
+    """抽查原 PDF 里图像的压缩方式：是不是 JPEG、质量大概多少。只读各图的文件头，很快。"""
+    pages = [p for p in infos if p.bbox and p.mode == "native"]
+    step = max(len(pages) / samples, 1)
+    picked = [pages[int(k * step)] for k in range(min(samples, len(pages)))]
+    qualities = []
+    for info in picked:
+        if "DCTDecode" in doc.xref_get_key(info.xref, "Filter")[1]:
+            q = jpeg_quality_of(doc.xref_stream_raw(info.xref))
+            if q:
+                qualities.append(q)
+    jpeg = bool(picked) and len(qualities) * 2 > len(picked)
+
+    # 需要渲染的页（一页里有多张图、带旋转等，取不了内嵌原图）：量一下这些页里图像的实际分辨率
+    rendered = [p for p in infos if p.mode == "render"]
+    step = max(len(rendered) / samples, 1)
+    dpis = []
+    for info in [rendered[int(k * step)] for k in range(min(samples, len(rendered)))]:
+        page = doc[info.index]
+        page_dpis = []
+        for item in page.get_images(full=True):
+            try:
+                width = page.get_image_bbox(item).width
+            except Exception:
+                continue
+            if width > 1:
+                page_dpis.append(item[2] / width * 72)
+        if page_dpis:
+            dpis.append(max(page_dpis))
+    return {"jpeg": jpeg, "quality": float(np.median(qualities)) if jpeg else None,
+            "render_pages": len(rendered), "render_dpi": float(np.median(dpis)) if dpis else None}
+
+
+def _mostly_bilevel(infos):
+    pages = [p for p in infos if p.bbox]
+    bilevel = [p for p in pages if p.bilevel]
+    return len(bilevel) * 2 > len(pages), bilevel
+
+
+def recommend_min_angle(infos, profile=None):
+    """根据全书的分析结果，给「小于此角度不旋转」提一个建议值。
+
+    旋转需要重新采样。黑白二值图每个像素非黑即白，旋转后笔画边缘会变糙，分辨率越低越明显；
+    JPEG 扫描件不旋转的页可以按块对齐平移、几乎无损地重存，旋转的页则要完整地重新压缩一次，
+    画质和体积都吃亏。而 0.2°～0.3° 以内的倾斜肉眼本来就看不出来，不值得为它旋转。
+    返回 (建议值, 理由, [(角度, 倾斜不小于该角度的页数), ...])；没有可修正的页时返回 None。
+    """
+    pages = [p for p in infos if p.bbox]
+    if not pages:
+        return None
+    mostly, bilevel = _mostly_bilevel(infos)
+    if mostly:
+        dpi = float(np.median([p.dpi for p in bilevel]))
+        value = 0.3 if dpi < 250 else 0.2
+        reason = f"黑白二值扫描、约 {dpi:.0f} DPI，旋转会让笔画边缘变糙，看不出来的轻微倾斜不值得旋转"
+    elif profile and profile["jpeg"]:
+        value = 0.2
+        reason = "JPEG 扫描：不旋转的页可以按块对齐平移，几乎无损、体积也小；旋转的页要重新压缩，体积约多三成"
+    else:
+        value = 0.1
+        reason = "无损压缩的灰度/彩色扫描，旋转几乎无损，轻微的倾斜也可以修正"
+    angles = np.abs([p.angle for p in pages])
+    counts = [(t, int((angles >= t - 1e-9).sum())) for t in ANGLE_STEPS]
+    return value, reason, counts
+
+
+def recommend_quality(infos, profile=None):
+    """给「JPEG 质量」提一个建议值。返回 (建议值或 None, 理由)；None 表示这一项对本书不起作用。
+
+    原文件是 JPEG 时，它的质量就是画质的上限：用更高的质量重存，文件成倍变大（质量 62 的原图
+    用 90 重存是 2.7 倍），细节却不会比原图多。所以建议值取「原图质量略高一档」——高出的这一点
+    用来抵消二次压缩带来的损失。
+    """
+    if not any(p.bbox for p in infos):
+        return None, ""
+    if _mostly_bilevel(infos)[0]:
+        return None, "本书输出为 1bit 黑白图像，不使用 JPEG，「JPEG 质量」不起作用"
+    if profile and profile["jpeg"]:
+        q = profile["quality"]
+        value = int(min(max(math.ceil((q + 5) / 5) * 5, 50), 95))
+        return value, (f"原文件是 JPEG、质量约 {q:.0f}，这就是画质的上限：用更高的质量重存只会让文件变大；"
+                       f"取略高一档用来抵消二次压缩的损失")
+    return 90, "原文件是无损压缩的图像，用较高的质量保留细节"
+
+
+def recommend_max_angle(infos, max_angle):
+    """给「倾斜检测范围」提建议。max_angle 是产生 infos 的那次分析用的范围。返回 (建议值, 理由)。
+
+    检测只在 ±max_angle 以内搜索。有页面的结果顶在范围的边上，说明它实际可能更歪、只是被范围
+    截住了，应该放宽了重新分析；否则现在的范围就够用——缩小它没有好处（只是分析快一点，
+    但改了这一项就得重新分析一遍）。
+    """
+    angles = np.abs([p.angle for p in infos if p.bbox])
+    if not len(angles):
+        return None, ""
+    at_limit = int((angles >= max_angle - 0.26).sum())
+    if at_limit:
+        value = float(min(max_angle + 3, 15))
+        if value > max_angle:
+            return value, (f"有 {at_limit} 页检测到的倾斜顶在了 ±{max_angle:g}° 的边上，实际可能更歪；"
+                           f"放宽范围后需要重新分析")
+    return float(max_angle), f"全书最大的倾斜是 {angles.max():.2f}°，±{max_angle:g}° 的范围足够"
+
+
+def recommend_dpi(profile):
+    """给「渲染 DPI」提建议。返回 (建议值或 None, 理由)；None 表示这一项对本书不起作用。
+
+    渲染 DPI 只用于取不了内嵌原图、需要渲染的页。按这些页里图像本身的分辨率渲染最合适：
+    低了丢细节，高了只是把同样的像素放大，文件变大、清晰度不变。
+    """
+    if not profile:
+        return None, ""
+    if not profile["render_pages"]:
+        return None, "全部页都直接取用内嵌原图，「渲染 DPI」不起作用"
+    if not profile["render_dpi"]:
+        return None, ""
+    value = int(min(max(round(profile["render_dpi"] / 50) * 50, 100), 600))
+    return value, (f"有 {profile['render_pages']} 页取不了内嵌原图、需要渲染，这些页里的图像约 "
+                   f"{profile['render_dpi']:.0f} DPI：按图像本身的分辨率渲染，不丢细节也不虚增体积；"
+                   f"改了这一项需要重新分析")
+
+
+def format_recommendation(infos, profile=None, max_angle=5.0):
+    """把建议整理成 {"min_angle", "quality", "max_angle", "dpi": 值或 None, "lines": [几行说明]}。
+
+    命令行和界面共用。max_angle 是产生 infos 的那次分析用的倾斜检测范围。
+    """
+    rec = recommend_min_angle(infos, profile)
+    if rec is None:
+        return {"min_angle": None, "quality": None, "max_angle": None, "dpi": None, "lines": []}
+    value, reason, counts = rec
+    total = sum(1 for p in infos if p.bbox)
+    lines = ["倾斜分布：" + "  ".join(f"≥{t}°: {n} 页" for t, n in counts) + f"  （共 {total} 页）"]
+    rotated = dict(counts)[value]
+    lines.append(f"「小于此角度不旋转」建议设为 {value}°：{reason}。")
+    lines.append(f"  按此设置有 {rotated} 页需要旋转，其余 {total - rotated} 页只平移、不旋转。")
+    quality, q_reason = recommend_quality(infos, profile)
+    if quality is not None:
+        lines.append(f"「JPEG 质量」建议设为 {quality}：{q_reason}。")
+    elif q_reason:
+        lines.append(q_reason + "。")
+    wide, w_reason = recommend_max_angle(infos, max_angle)
+    if wide is not None and wide != max_angle:
+        lines.append(f"「倾斜检测范围」建议设为 ±{wide:g}°：{w_reason}。")
+    elif w_reason:
+        lines.append(f"「倾斜检测范围」不用改：{w_reason}。")
+    dpi, d_reason = recommend_dpi(profile)
+    if dpi is not None:
+        lines.append(f"「渲染 DPI」建议设为 {dpi}：{d_reason}。")
+    elif d_reason:
+        lines.append(d_reason + "。")
+    return {"min_angle": value, "quality": quality, "max_angle": wide, "dpi": dpi, "lines": lines}
+
+
+def plan_page(info, ref, opts, skip=False):
+    """根据分析结果和选项，决定这一页实际要做的旋转角度和平移量。
+
+    skip 表示用户指定了「本页不修正」：原样复制，但它的分析结果仍然参与全书标准版心的统计。
+    """
+    if skip:
+        return 0.0, (0.0, 0.0), True, "本页不修正（手动指定）"
+    angle = info.angle if opts.deskew and abs(info.angle) >= opts.min_angle else 0.0
+    shift = (0.0, 0.0)
+    if info.bbox and opts.center:
+        shift = compute_shift(info, ref, opts.per_page)
+    trivial = angle == 0.0 and max(abs(shift[0]), abs(shift[1])) < 0.003
+    untouched = info.mode == "copy" or (trivial and not opts.clean_margin)
+    if untouched:
+        status = info.note or "无需修正"
+    else:
+        status = (f"旋转 {angle:+.2f}°  平移 x{shift[0] * 100:+.1f}% y{shift[1] * 100:+.1f}%"
+                  + (f"  ({info.note})" if info.note else ""))
+    return angle, shift, untouched, status
+
+
+def process_document(doc, infos, opts, output, progress=None, log=None, cancelled=None,
+                     copy_toc=True, ref=None, skip_pages=(), delete_pages=()):
+    """第 2 遍：变换并输出。返回实际修正的页数。
+
+    ref 是标准版心的统计结果；只处理部分页时可传入全书的统计，省略则从 infos 计算。
+    skip_pages 是用户指定「不做修正」的页（从 0 开始的页序）。
+    delete_pages 是用户指定删除的页：不输出到新 PDF（原文件不受影响），目录书签的页码相应前移。
+    """
+    ref = ref or compute_reference(infos)
+    kept = [info.index for info in infos if info.index not in delete_pages]
+    if not kept:
+        raise ValueError("要处理的页全部被标记为删除，没有可输出的页")
+    out = fitz.open()
+    changed = 0
+    for k, info in enumerate(infos, 1):
+        if cancelled and cancelled():
+            raise Cancelled
+        if info.index in delete_pages:
+            if log:
+                log(f"[{k}/{len(infos)}] 第 {info.index + 1} 页: 已删除，不输出")
+            if progress:
+                progress(k, len(infos))
+            continue
+        page = doc[info.index]
+        angle, shift, untouched, status = plan_page(info, ref, opts, skip=info.index in skip_pages)
+        if untouched:
+            out.insert_pdf(doc, from_page=info.index, to_page=info.index)
+        else:
+            img = load_page_image(doc, page, info, opts.dpi)
+            img = transform_image(img, info, angle, shift, opts.clean_margin,
+                                  scale=2 if opts.upscale and info.bilevel else 1,
+                                  bbox=content_box(info, ref))
+            new_page = out.new_page(width=page.rect.width, height=page.rect.height)
+            new_page.insert_image(new_page.rect, keep_proportion=False,
+                                  stream=encode_image(img, info.bilevel, opts.quality))
+            changed += 1
+        if log:
+            log(f"[{k}/{len(infos)}] 第 {info.index + 1} 页: {status}")
+        if progress:
+            progress(k, len(infos))
+
+    if copy_toc:
+        toc = remap_toc(doc.get_toc(), kept)
+        if toc:
+            out.set_toc(toc)
+    out.set_metadata(doc.metadata)
+    out.save(output, garbage=3, deflate=True)
+    return changed
+
+
+def page_source_bytes(doc, page):
+    """这一页内嵌图像在原 PDF 里占的字节数（压缩后的流长度）。"""
+    total = 0
+    for item in page.get_images(full=True):
+        kind, value = doc.xref_get_key(item[0], "Length")
+        if kind == "int":
+            total += int(value)
+    return total
+
+
+def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), samples=12,
+                         cache=None, cancelled=None):
+    """预估输出文件的大小（字节）。返回 (预估值, 原样复制的页数, 重新编码的页数, 抽样页数)。
+
+    原样复制的页按它在原 PDF 里的图像大小算。要重新编码的页，均匀抽 samples 页真的处理一遍，
+    得到「处理后大小 / 原图大小」的比例，再用这个比例推算其余的页——页与页之间内容多少差别
+    很大，按比例推比按平均每页大小推准得多。cache 用来在多次预估之间复用抽样页的编码结果。
+
+    抽样页的大小不能直接用编码出来的图像字节数：PNG 交给 PyMuPDF 之后会被解码、重新压缩成
+    PDF 自己的流，1bit 黑白页因此会小 25% 左右。所以把抽样页真的写进一个内存里的临时 PDF，
+    按和正式输出相同的方式保存，以它的实际大小为准。
+    """
+    cache = cache if cache is not None else {}
+    copied_bytes, copied, work = 0, 0, []
+    for info in infos:
+        if info.index in delete_pages:
+            continue
+        angle, shift, untouched, _ = plan_page(info, ref, opts, skip=info.index in skip_pages)
+        src = page_source_bytes(doc, doc[info.index])
+        if untouched:
+            copied_bytes += src
+            copied += 1
+        else:
+            work.append((info, angle, shift, src))
+    if not work:
+        return copied_bytes + 1500 * copied, copied, 0, 0
+
+    # 旋转的页和只平移的页分开抽样、分开算比例：只平移的页（尤其是块对齐的 JPEG）重存后几乎
+    # 不变大，旋转的页要大三到五成，混在一起抽样，预估会随两类页的比例飘
+    total, n_sampled = copied_bytes + 1500 * copied, 0
+    groups = [[w for w in work if w[1] == 0.0], [w for w in work if w[1] != 0.0]]
+    for group in groups:
+        if not group:
+            continue
+        n = min(len(group), max(4, round(samples * len(group) / len(work))))
+        step = len(group) / n
+        picked = sorted({int(k * step) for k in range(n)})
+        tmp = fitz.open()
+        for j in picked:
+            if cancelled and cancelled():
+                raise Cancelled
+            info, angle, shift, src = group[j]
+            scale = 2 if opts.upscale and info.bilevel else 1
+            key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4),
+                   opts.clean_margin, scale, None if info.bilevel else opts.quality, opts.dpi)
+            if key not in cache:
+                img = load_page_image(doc, doc[info.index], info, opts.dpi)
+                img = transform_image(img, info, angle, shift, opts.clean_margin, scale=scale,
+                                      bbox=content_box(info, ref))
+                cache[key] = encode_image(img, info.bilevel, opts.quality)
+            rect = doc[info.index].rect
+            tmp.new_page(width=rect.width, height=rect.height).insert_image(
+                fitz.Rect(0, 0, rect.width, rect.height), stream=cache[key], keep_proportion=False)
+
+        sampled_src = sum(group[j][3] for j in picked)
+        sampled_out = len(tmp.tobytes(garbage=3, deflate=True))    # 已含这几页的 PDF 结构开销
+        rest = [w[3] for j, w in enumerate(group) if j not in picked]
+        if sampled_src > 0:
+            total += sampled_out + sum(rest) * sampled_out / sampled_src
+        else:                               # 原图大小取不到（渲染模式等）：退回到按平均每页大小推算
+            total += sampled_out + len(rest) * sampled_out / len(picked)
+        total += 1500 * len(rest)           # 1500: 每页的 PDF 结构开销
+        n_sampled += len(picked)
+    return int(total), copied, len(work), n_sampled
+
+
+def format_size(n):
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB"
+
+
+def remap_toc(toc, kept):
+    """删掉一些页之后，把目录书签的页码换算成新 PDF 里的页码。
+
+    kept 是保留下来的页（原页序，从 0 开始，升序）。指向被删页的书签改为指向它后面
+    第一个保留页（后面没有了就指向最后一页）；书签本身不删，免得破坏目录的层级。
+    """
+    result = []
+    for entry in toc:
+        entry = list(entry)
+        if entry[2] >= 1:
+            j = min(bisect.bisect_left(kept, entry[2] - 1), len(kept) - 1)
+            entry[2] = j + 1
+        result.append(entry)
+    return result
+
+
+def preview_page(doc, info, ref, opts, skip=False):
+    """生成单页的处理前/处理后图像（供图形界面预览）。"""
+    page = doc[info.index]
+    angle, shift, untouched, status = plan_page(info, ref, opts, skip)
+    render_info = info if info.mode != "copy" else PageInfo(index=info.index, mode="render")
+    before = load_page_image(doc, page, render_info, 100 if info.mode == "copy" else opts.dpi)
+    after = before if untouched else transform_image(
+        before, info, angle, shift, opts.clean_margin, scale=2 if opts.upscale and info.bilevel else 1,
+        bbox=content_box(info, ref))
+    if info.bilevel and not untouched:      # 预览也按实际输出那样二值化，所见即所得
+        after = cv2.threshold(to_gray(after), 127, 255, cv2.THRESH_BINARY)[1]
+    box = None
+    if info.bbox and not untouched:
+        b = page_box(info, ref)
+        box = (b[0] + shift[0], b[1] + shift[1], b[2] + shift[0], b[3] + shift[1])
+    return before, after, box, status
+
+
+def parse_pages(spec, total):
+    if not spec:
+        return list(range(total))
+    pages = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        start, end = int(a), int(b) if b else int(a)
+        pages.extend(range(max(start, 1) - 1, min(end, total)))
+    return pages
+
+
+def main():
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="replace")
+
+    ap = argparse.ArgumentParser(description="扫描书籍 PDF 整形：纠偏 + 版心居中")
+    ap.add_argument("input", type=Path)
+    ap.add_argument("-o", "--output", type=Path)
+    ap.add_argument("--pages", help="只处理指定页，如 1-20 或 3,5,8-12（页码从 1 开始）")
+    ap.add_argument("--skip-pages", help="这些页不做修正、原样保留，写法同 --pages")
+    ap.add_argument("--delete-pages", help="这些页不输出到新 PDF，写法同 --pages")
+    ap.add_argument("--max-angle", type=float, default=5.0, help="倾斜检测范围 ±度 (默认 5)")
+    ap.add_argument("--min-angle", type=float, default=None,
+                    help="小于此角度不旋转 (默认: 分析全书后自动采用建议值)")
+    ap.add_argument("--dpi", type=int, default=300, help="无法直接取原图的页面的渲染 DPI (默认 300)")
+    ap.add_argument("--quality", type=int, default=None,
+                    help="JPEG 质量 (默认: 分析全书后自动采用建议值；原文件不是 JPEG 时为 90)")
+    ap.add_argument("--no-deskew", action="store_true", help="不做倾斜校正")
+    ap.add_argument("--no-center", action="store_true", help="不做版心居中")
+    ap.add_argument("--per-page", action="store_true",
+                    help="每页各自居中（默认会参照全书标准版心，避免半页内容跑到页面中间）")
+    ap.add_argument("--clean-margin", action="store_true", help="把版心以外涂成纸色（去黑边、阴影）")
+    ap.add_argument("--upscale", action="store_true",
+                    help="黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）")
+    args = ap.parse_args()
+
+    output = args.output or default_output_path(args.input)
+    opts = Options(deskew=not args.no_deskew, center=not args.no_center, per_page=args.per_page,
+                   clean_margin=args.clean_margin, upscale=args.upscale, max_angle=args.max_angle,
+                   min_angle=args.min_angle or 0.0, dpi=args.dpi, quality=args.quality or 90)
+    doc = fitz.open(args.input)
+    indices = parse_pages(args.pages, doc.page_count)
+
+    infos = analyze_document(
+        doc, indices, opts,
+        progress=lambda k, n: print(f"\r分析中 {k}/{n}", end="", flush=True))
+    print()
+    rec = format_recommendation(infos, source_profile(doc, infos), opts.max_angle)
+    for line in rec["lines"]:
+        print(line)
+    if args.min_angle is None:
+        opts.min_angle = rec["min_angle"] if rec["min_angle"] is not None else 0.1
+        print(f"未指定 --min-angle，采用 {opts.min_angle}°")
+    if args.quality is None and rec["quality"] is not None:
+        opts.quality = rec["quality"]
+        print(f"未指定 --quality，采用 {opts.quality}")
+    skip_pages = set(parse_pages(args.skip_pages, doc.page_count)) if args.skip_pages else set()
+    delete_pages = set(parse_pages(args.delete_pages, doc.page_count)) if args.delete_pages else set()
+    estimate = estimate_output_size(doc, infos, compute_reference(infos), opts, skip_pages, delete_pages)[0]
+    print(f"预计输出约 {format_size(estimate)}（原文件 {format_size(args.input.stat().st_size)}）")
+    changed = process_document(doc, infos, opts, output, log=print, copy_toc=not args.pages,
+                               skip_pages=skip_pages, delete_pages=delete_pages)
+    deleted = sum(1 for p in infos if p.index in delete_pages)
+    print(f"\n完成：共 {len(infos)} 页，修正 {changed} 页"
+          + (f"，删除 {deleted} 页" if deleted else "") + f" → {output}（{format_size(Path(output).stat().st_size)}）")
+
+
+if __name__ == "__main__":
+    main()

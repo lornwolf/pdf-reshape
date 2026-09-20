@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.stackdump
+
+# 处理过程中产生的 PDF 不入库
+*.pdf
