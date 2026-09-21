@@ -24,6 +24,14 @@ from pdf_reshape_store import Store
 PREVIEW_MAX_SIDE = 1600   # 预览用图像的长边上限（像素）
 LOUPE_SIZE = 300          # 放大镜的边长（屏幕像素）
 LOUPE_SPAN = 0.07         # 放大镜里显示页面宽度的 7%
+HANDLE_HALF = 4           # 版心框上拖动用的白色小方块：边长的一半（屏幕像素）
+HANDLE_REACH = 9          # 鼠标离小方块的中心不到这么远就算点中（比方块本身大一圈，好点）
+MIN_BOX = 0.05            # 拖动时版心至少留这么宽（高），和 core.page_box 的限制一致
+# 八个小方块各管哪几条边：(水平方向的边, 竖直方向的边)，数字是版心 (左, 上, 右, 下) 里的下标，
+# None = 这个方向不动（边的中点）。四个角动相邻的两条边，四个中点只平移自己那条边
+HANDLES = ((0, 1), (None, 1), (2, 1), (0, None), (2, None), (0, 3), (None, 3), (2, 3))
+HANDLE_CURSORS = {(0, 1): "size_nw_se", (2, 3): "size_nw_se", (2, 1): "size_ne_sw", (0, 3): "size_ne_sw",
+                  (0, None): "size_we", (2, None): "size_we", (None, 1): "size_ns", (None, 3): "size_ns"}
 NUDGE_STEP = 0.002        # 版心边框每按一次移动页面宽（高）的 0.2%
 ESTIMATE_DELAY = 800      # 设置变了之后等这么久（毫秒）再重新预估输出大小
 NUDGE_ESTIMATE_DELAY = 2000   # 调版心边框时等得更久：停手 2 秒之后才重新预估
@@ -48,6 +56,10 @@ class App(tk.Tk):
         self.pending_run = None            # 分析结束后要接着执行的处理任务
         self.preview_gen = 0               # 预览请求序号，用来丢弃过期结果
         self.preview_data = None           # (before, after, box, 本页是否已删除)
+        self.preview_index = None          # preview_data 是第几页的（从 0 开始）
+        self.preview_shown_gen = 0         # preview_data 属于第几次预览请求
+        self.drag = None                   # 正在拖版心框：(小方块, 按下时的 x, y, 按下时的红框)
+        self.drag_box = None               # 拖到现在红框的样子
         self.preview_after_id = None
         self.preview_full = None           # (处理前, 处理后, 平移量)：原尺寸的图，放大镜用
         self.preview_geometry = [None, None]   # 两个预览画布上页面图像的位置 (x0, y0, 宽, 高)
@@ -58,11 +70,15 @@ class App(tk.Tk):
         self.deleted = set()               # 用户指定「删除当前页」的页：新 PDF 中不输出
         self.adjust = {}                   # 用户对版心边框的手动微调 {页序: (左, 上, 右, 下 的移动量)}
         self.cleanup = set()               # 用户指定「去除边缘污染」的页
+        self.align = {}                    # 用户点「版心居中」那一刻的 adjust：对齐按它算（见 core.align_box）
         self.estimate_gen = 0              # 输出大小预估的请求序号（丢弃过期结果用）
         self.estimate_key = None           # 上次预估时的全部相关设置；没变就不重算
         self.estimate_cache = {}           # 抽样页的编码结果，多次预估之间复用
         self.estimate_after_id = None
         self.nudged_at = 0.0               # 最近一次调版心边框的时刻（time.monotonic）
+        self.estimate_running = False      # 有一次预估正在算
+        self.locked = False                # 分析、处理期间：会改变输出的控件都不可用
+        self.lockable = []                 # 平时一直可用、锁住时才不可用的控件（其余的各有各的条件）
         try:
             self.store = Store()
         except Exception as e:             # 数据库打不开也不影响整形本身，只是不能保存进度
@@ -93,11 +109,16 @@ class App(tk.Tk):
         self.var_output = tk.StringVar()
         ttk.Label(files, text="输入 PDF").grid(row=0, column=0, sticky="w", **pad)
         ttk.Entry(files, textvariable=self.var_input, state="readonly").grid(row=0, column=1, sticky="ew", **pad)
-        ttk.Button(files, text="打开…", command=self.browse_input).grid(row=0, column=2, sticky="ew", **pad)
-        ttk.Button(files, text="历史记录…", command=self.show_history).grid(row=0, column=3, **pad)
+        lock = self.lockable.append
+        lock(ttk.Button(files, text="打开…", command=self.browse_input))
+        self.lockable[-1].grid(row=0, column=2, sticky="ew", **pad)
+        lock(ttk.Button(files, text="历史记录…", command=self.show_history))
+        self.lockable[-1].grid(row=0, column=3, **pad)
         ttk.Label(files, text="输出 PDF").grid(row=1, column=0, sticky="w", **pad)
-        ttk.Entry(files, textvariable=self.var_output).grid(row=1, column=1, sticky="ew", **pad)
-        ttk.Button(files, text="另存为…", command=self.browse_output).grid(row=1, column=2, sticky="ew", **pad)
+        lock(ttk.Entry(files, textvariable=self.var_output))
+        self.lockable[-1].grid(row=1, column=1, sticky="ew", **pad)
+        lock(ttk.Button(files, text="另存为…", command=self.browse_output))
+        self.lockable[-1].grid(row=1, column=2, sticky="ew", **pad)
 
         body = ttk.Frame(self)
         body.pack(fill="both", expand=True, padx=8, pady=4)
@@ -120,8 +141,8 @@ class App(tk.Tk):
                           ("版心外涂成纸色\n（去黑边、阴影）", self.var_clean),
                           ("黑白页旋转时 2 倍分辨率\n（笔画更平滑，体积变大）", self.var_upscale),
                           ("显示增强\n（只增强能明显改善的页）", self.var_enhance)]:
-            ttk.Checkbutton(box, text=text, variable=var,
-                            command=self.schedule_preview).pack(anchor="w", **pad)
+            lock(ttk.Checkbutton(box, text=text, variable=var, command=self.schedule_preview))
+            self.lockable[-1].pack(anchor="w", **pad)
 
         box = ttk.LabelFrame(side, text="参数")
         box.pack(fill="x", pady=(0, 6))
@@ -135,8 +156,9 @@ class App(tk.Tk):
                 ("渲染 DPI", self.var_dpi, 100, 600, 50)]
         for r, (text, var, lo, hi, step) in enumerate(rows):
             ttk.Label(box, text=text).grid(row=r, column=0, sticky="w", **pad)
-            ttk.Spinbox(box, textvariable=var, from_=lo, to=hi, increment=step, width=6,
-                        command=self.schedule_preview).grid(row=r, column=1, **pad)
+            lock(ttk.Spinbox(box, textvariable=var, from_=lo, to=hi, increment=step, width=6,
+                             command=self.schedule_preview))
+            self.lockable[-1].grid(row=r, column=1, **pad)
 
         # 分析完全书后在这里显示各个参数的建议值（每项一行提示，没有建议的不显示）
         self.rec = {}                       # {"min_angle" / "quality" / "max_angle" / "dpi": 建议值或 None}
@@ -147,11 +169,13 @@ class App(tk.Tk):
         self.rec_button_row = len(rows) + 4
         # 一个按钮管所有的建议值：「采用建议值」↔「恢复默认值」
         self.btn_recommend = ttk.Button(box, text="采用建议值", command=self.toggle_recommendation)
+        lock(self.btn_recommend)
 
         box = ttk.LabelFrame(side, text="处理范围")
         box.pack(fill="x", pady=(0, 6))
         self.var_pages = tk.StringVar()
-        ttk.Entry(box, textvariable=self.var_pages, width=22).pack(fill="x", **pad)
+        lock(ttk.Entry(box, textvariable=self.var_pages, width=22))
+        self.lockable[-1].pack(fill="x", **pad)
         ttk.Label(box, text="例: 1-20 或 3,5,8-12\n留空 = 全部页", foreground="#666").pack(anchor="w", **pad)
 
         # 分析结果是从历史记录里恢复的（不是这次现算的）时才显示：原文件内容变了、或者想重新来过时用
@@ -216,7 +240,10 @@ class App(tk.Tk):
             btn.pack(side="left", padx=1)
             self.nudge_buttons[arrow] = btn
         self.btn_nudge_reset = ttk.Button(edge_bar, text="复位", width=5, command=self.reset_nudge, state="disabled")
-        self.btn_nudge_reset.pack(side="left", padx=(10, 6))
+        self.btn_nudge_reset.pack(side="left", padx=(10, 2))
+        # 调红框本身不移动页面；点这个按钮才按现在的红框重新对齐。「复位」把两者一起撤销
+        self.btn_center = ttk.Button(edge_bar, text="版心居中", width=9, command=self.center_by_box, state="disabled")
+        self.btn_center.pack(side="left", padx=(2, 6))
         # 红框照邻页的来：当前页的红框判断得不好、邻页的好时用。结果记成手动微调，可以再调、可以复位
         self.btn_like_prev = ttk.Button(edge_bar, text="与前页相同", state="disabled",
                                         command=lambda: self.copy_neighbor_box(-1))
@@ -241,9 +268,12 @@ class App(tk.Tk):
             cv.grid(row=1, column=c, sticky="nsew", padx=2)
             cv.bind("<Configure>", lambda e: self.draw_preview())
             # 点一下预览图，方向键就回来翻页；按住不放是放大镜（两边同时放大同一处，对比增强前后）
-            cv.bind("<ButtonPress-1>", lambda e, c=c: (e.widget.focus_set(), self.show_loupe(c, e.x, e.y)))
-            cv.bind("<B1-Motion>", lambda e, c=c: self.show_loupe(c, e.x, e.y))
-            cv.bind("<ButtonRelease-1>", lambda e: self.hide_loupe())
+            # 「处理后」一侧按在红框的小方块上则是拖版心框
+            cv.bind("<ButtonPress-1>", lambda e, c=c: (e.widget.focus_set(), self.on_canvas_press(c, e.x, e.y)))
+            cv.bind("<B1-Motion>", lambda e, c=c: self.on_canvas_motion(c, e.x, e.y))
+            cv.bind("<ButtonRelease-1>", lambda e, c=c: self.on_canvas_release(c))
+            if c == 1:
+                cv.bind("<Motion>", lambda e: self.update_cursor(e.x, e.y))
             self.canvases.append(cv)
         # 键盘翻页：PageUp/PageDown、上下左右方向键、Home/End
         for key, delta in (("<Prior>", -1), ("<Next>", 1), ("<Up>", -1), ("<Down>", 1),
@@ -392,6 +422,7 @@ class App(tk.Tk):
         self.skipped = self.store.flagged_pages(book["id"], "skip")
         self.deleted = self.store.flagged_pages(book["id"], "deleted")
         self.adjust = self.store.box_adjusts(book["id"])
+        self.align = self.store.box_adjusts(book["id"], "box_align")
         self.cleanup = self.store.flagged_pages(book["id"], "cleanup")
 
     def update_skip_label(self):
@@ -419,6 +450,7 @@ class App(tk.Tk):
         """把逐页的手动设定挂到标准版心的统计结果上；core 的 page_box / cleanup_box 会自动用上。"""
         if self.ref is not None:
             self.ref["adjust"] = self.adjust
+            self.ref["align"] = self.align
             self.ref["cleanup"] = self.cleanup
 
     def neighbor_index(self, direction):
@@ -448,9 +480,14 @@ class App(tk.Tk):
         self.update_nudge_buttons()
         self.request_preview()
 
+    def adjust_ready(self):
+        """现在能不能调版心边框：全书分析好了（分析参数没改过），而且没在分析、处理。"""
+        return (not self.locked and self.ref is not None
+                and self.analysis_key == self.current_key(self.get_options()))
+
     def update_nudge_buttons(self):
         """选「上/下」时只有上下箭头可用，选「左/右」时只有左右箭头可用；全书分析完之前都不可用。"""
-        ready = self.ref is not None and self.analysis_key == self.current_key(self.get_options())
+        ready = self.adjust_ready()
         vertical_edge = self.var_edge.get() in ("上", "下")
         for arrow, btn in self.nudge_buttons.items():
             usable = ready and (arrow in "↑↓") == vertical_edge
@@ -463,13 +500,15 @@ class App(tk.Tk):
             state="normal" if has_box and self.neighbor_index(1) is not None else "disabled")
         self.btn_cleanup.configure(state="normal" if has_box else "disabled",
                                    text="取消去除污染" if index in self.cleanup else "去除边缘污染")
-        offsets = self.adjust.get(index)
-        self.btn_nudge_reset.configure(state="normal" if ready and offsets else "disabled")
-        if offsets:
-            parts = [f"{name}{offsets[i] * 100:+.1f}%" for name, i in EDGES.items() if abs(offsets[i]) > 1e-9]
-            self.lbl_nudge.configure(text="本页已微调: " + "  ".join(parts))
-        else:
-            self.lbl_nudge.configure(text="")
+        offsets, aligned = self.adjust.get(index), self.align.get(index)
+        self.btn_nudge_reset.configure(state="normal" if ready and (offsets or aligned) else "disabled")
+        pending = offsets != aligned         # 红框和上次「版心居中」时的不一样：页面还没有按现在的红框对齐
+        self.btn_center.configure(state="normal" if has_box and pending else "disabled")
+        parts = [f"{name}{offsets[i] * 100:+.1f}%" for name, i in EDGES.items() if abs(offsets[i]) > 1e-9] if offsets else []
+        text = "本页已微调: " + "  ".join(parts) if parts else ""
+        if pending:
+            text += ("  " if text else "红框已复原  ") + "（点「版心居中」按现在的红框对齐）"
+        self.lbl_nudge.configure(text=text)
 
     def nudge(self, direction):
         """把选中的那条边移动一步。direction: -1 向上/向左，+1 向下/向右。"""
@@ -482,7 +521,27 @@ class App(tk.Tk):
         self.set_adjust(index, offsets)
 
     def reset_nudge(self):
+        """撤销这一页红框的调整，连同手动的「版心居中」：回到自动判断的结果。"""
+        self.set_align(self.current_index(), None)
         self.set_adjust(self.current_index(), None)
+
+    def center_by_box(self):
+        """按现在的红框重新对齐这一页。记下的是这一刻的红框：之后再调红框页面不会动，要再点一次。"""
+        if not self.adjust_ready() or not self.page_count:
+            return
+        index = self.current_index()
+        self.set_align(index, self.adjust.get(index))
+        self.update_nudge_buttons()
+        self.hold_estimate()
+        self.schedule_preview()
+
+    def set_align(self, index, offsets):
+        if offsets and any(offsets):
+            self.align[index] = offsets
+        else:
+            self.align.pop(index, None)
+        if self.store and self.book:
+            self.store.set_box_adjust(self.book["id"], index, offsets, column="box_align")
 
     def set_adjust(self, index, offsets):
         if offsets and any(offsets):
@@ -503,7 +562,7 @@ class App(tk.Tk):
             self.after_cancel(self.estimate_after_id)
             self.estimate_after_id = None
         self.estimate_gen += 1               # 正在算的那一次看到序号变了就会中止
-        self.estimate_key = None
+        self.estimate_key, self.estimate_running = None, False
         if self.lbl_estimate.cget("text"):
             self.lbl_estimate.configure(text="预计输出大小：调整结束后重新计算…")
 
@@ -604,6 +663,8 @@ class App(tk.Tk):
     def schedule_estimate(self):
         """相关设置变了就重新预估输出大小。翻页不影响大小，不会触发重算。"""
         opts = self.get_options()
+        if self.locked:
+            return                          # 处理期间不预估：设置改不了，也免得和处理抢 CPU
         if self.analysis_key != self.current_key(opts):
             return                          # 全书分析还没好（或者分析参数改了），无从预估
         try:
@@ -612,7 +673,7 @@ class App(tk.Tk):
             return
         key = (self.analysis_key, opts.deskew, opts.center, opts.per_page, opts.clean_margin, opts.upscale, opts.enhance,
                opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices),
-               tuple(sorted(self.adjust.items())), frozenset(self.cleanup))
+               tuple(sorted(self.adjust.items())), tuple(sorted(self.align.items())), frozenset(self.cleanup))
         if key == self.estimate_key or not indices:
             return
         self.estimate_key = key
@@ -628,6 +689,7 @@ class App(tk.Tk):
             self.estimate_key = None        # 排队期间分析结果被清掉了（重新分析、换了一本书）：作废，等下次再算
             return
         self.estimate_gen += 1
+        self.estimate_running = True
         self.lbl_estimate.configure(text="预计输出大小：计算中…")
         infos = [self.infos[i] for i in indices]
         threading.Thread(target=self._estimate_thread, daemon=True,
@@ -686,7 +748,7 @@ class App(tk.Tk):
         self.rec = {}
         self.update_recommend_label()
         self.estimate_gen += 1              # 作废上一本书还在算的预估
-        self.estimate_key, self.estimate_cache = None, {}
+        self.estimate_key, self.estimate_cache, self.estimate_running = None, {}, False
         self.lbl_estimate.configure(text="")
         self.spin_page.configure(to=self.page_count)
         self.var_page.set(1)
@@ -694,6 +756,7 @@ class App(tk.Tk):
         self.skipped = set()
         self.deleted = set()
         self.adjust = {}
+        self.align = {}
         self.cleanup = set()
         self.btn_delete.configure(state="normal")
         self.lbl_total.configure(text=f"/ {self.page_count}")
@@ -752,10 +815,9 @@ class App(tk.Tk):
         self.rec = {}
         self.update_recommend_label()
         self.estimate_gen += 1
-        self.estimate_key, self.estimate_cache = None, {}
+        self.estimate_key, self.estimate_cache, self.estimate_running = None, {}, False
         self.lbl_estimate.configure(text="")
         self.progress.configure(value=0)
-        self.btn_reanalyze.configure(state="disabled")
         self.write_log("重新分析全书…")
         self.start_analysis()
         self.schedule_preview()
@@ -763,6 +825,7 @@ class App(tk.Tk):
     def start_analysis(self):
         opts = self.get_options()
         self.analyzing_key = self.current_key(opts)
+        self.set_locked(True)
         self.start_worker(self._analyze_thread, self.analyzing_key, opts)
 
     def _analyze_thread(self, key, opts):
@@ -796,7 +859,7 @@ class App(tk.Tk):
             return
 
         job = (opts, indices, out, not self.var_pages.get().strip())
-        self.btn_run.configure(state="disabled")
+        self.set_locked(True)               # 从这一刻起设置就定下来了（要先重新分析的也一样）
         if self.analysis_key == self.current_key(opts):
             self.start_process(job)
         elif self.worker and self.worker.is_alive() and self.analyzing_key == self.current_key(opts):
@@ -818,7 +881,9 @@ class App(tk.Tk):
         opts, indices, out, whole = job
         infos = [self.infos[i] for i in indices]
         self.save_state()
-        self.start_worker(self._process_thread, self.var_input.get(), infos, self.ref, opts, out, whole,
+        # 标准版心和挂在上面的逐页设定交副本：处理线程一页一页地读它们，不能和界面共用
+        ref = dict(self.ref, adjust=dict(self.adjust), align=dict(self.align), cleanup=frozenset(self.cleanup))
+        self.start_worker(self._process_thread, self.var_input.get(), infos, ref, opts, out, whole,
                           frozenset(self.skipped), frozenset(self.deleted))
 
     def _process_thread(self, src, infos, ref, opts, out, whole, skipped, deleted):
@@ -829,6 +894,32 @@ class App(tk.Tk):
                 log=lambda s: self.msgs.put(("log", s)),
                 cancelled=self.cancel_event.is_set)
         self.msgs.put(("done", changed, len(infos), sum(1 for p in infos if p.index in deleted), out))
+
+    def set_locked(self, locked):
+        """分析、处理期间锁住所有会改变输出的控件，结束（完成、取消、出错）后恢复。
+
+        处理用的是点「开始处理」那一刻的设置：期间再改，界面上看着生效了，输出里却没有。分析期间
+        也锁（用户要求）：打开文件之后等全书分析完才能动设置。
+        「取消」、翻页和预览、放大镜、辅助线不锁——一本书要几分钟，边等边翻看是有用的，而且都是只读的。
+        """
+        self.locked = locked
+        for widget in self.lockable:
+            widget.configure(state="disabled" if locked else "normal")
+        self.btn_reanalyze.configure(state="disabled" if locked else "normal")
+        for btn in (self.btn_run, self.btn_skip, self.btn_delete):
+            btn.configure(state="normal" if self.page_count and not locked else "disabled")
+        self.update_nudge_buttons()
+        self.draw_preview()                 # 红框上拖动用的小方块跟着出现、消失
+        if locked:                          # 排队中的、正在算的预估都停掉，解锁之后再算
+            if self.estimate_after_id:
+                self.after_cancel(self.estimate_after_id)
+                self.estimate_after_id, self.estimate_key = None, None
+            if self.estimate_running:
+                self.estimate_gen += 1
+                self.estimate_key, self.estimate_running = None, False
+                self.lbl_estimate.configure(text="预计输出大小：处理结束后重新计算…")
+        else:
+            self.schedule_estimate()
 
     def cancel(self):
         self.pending_run = None
@@ -901,7 +992,7 @@ class App(tk.Tk):
             def fit(img):
                 scale = PREVIEW_MAX_SIDE / max(img.shape[:2])
                 return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else img
-            self.msgs.put(("preview", gen, fit(before), fit(after), box, status, deleted, full))
+            self.msgs.put(("preview", gen, fit(before), fit(after), box, status, deleted, full, index))
         except Exception as e:
             self.msgs.put(("preview_error", gen, f"{type(e).__name__}: {e}"))
 
@@ -928,8 +1019,7 @@ class App(tk.Tk):
                 cv.create_line(x0 + dw / 2, y0, x0 + dw / 2, y0 + dh, fill="#2a7fff", dash=(4, 4))
                 cv.create_line(x0, y0 + dh / 2, x0 + dw, y0 + dh / 2, fill="#2a7fff", dash=(4, 4))
                 if slot == 1 and box:
-                    cv.create_rectangle(x0 + box[0] * dw, y0 + box[1] * dh,
-                                        x0 + box[2] * dw, y0 + box[3] * dh, outline="#e03131")
+                    self.draw_box(box)
             if slot == 1 and deleted:       # 已删除的页：在「处理后」一侧打上红叉
                 cv.create_line(x0, y0, x0 + dw, y0 + dh, fill="#d00000", width=4)
                 cv.create_line(x0 + dw, y0, x0, y0 + dh, fill="#d00000", width=4)
@@ -937,6 +1027,95 @@ class App(tk.Tk):
                                     fill="#d00000", outline="")
                 cv.create_text(x0 + dw / 2, y0 + dh / 2, text="已删除 · 不输出", fill="white",
                                font=("Microsoft YaHei UI", 14, "bold"))
+
+    # ------------------------------------------------------------ 用鼠标拖版心框
+
+    def box_editable(self):
+        """预览里的红框现在能不能拖。画面上的红框必须就是当前页、当前设置下的：翻了页或改了设置、
+        新的预览还没出来的那一小会儿不能拖——拖动量是相对画面上的红框算的。"""
+        if not (self.preview_data and self.preview_geometry[1] and self.var_guides.get() and self.adjust_ready()):
+            return False
+        box, deleted = self.preview_data[2:]
+        return (bool(box) and not deleted and self.preview_after_id is None
+                and self.preview_shown_gen == self.preview_gen and self.preview_index == self.current_index())
+
+    def handle_points(self, box):
+        """八个小方块在「处理后」画布上的位置：[(小方块, x, y), ...]。"""
+        x0, y0, dw, dh = self.preview_geometry[1]
+        xs = {0: box[0], 2: box[2], None: (box[0] + box[2]) / 2}
+        ys = {1: box[1], 3: box[3], None: (box[1] + box[3]) / 2}
+        return [(h, x0 + xs[h[0]] * dw, y0 + ys[h[1]] * dh) for h in HANDLES]
+
+    def handle_at(self, x, y):
+        if not self.box_editable():
+            return None
+        near = [(max(abs(x - hx), abs(y - hy)), h) for h, hx, hy in self.handle_points(self.preview_data[2])]
+        reach, handle = min(near, key=lambda item: item[0])
+        return handle if reach <= HANDLE_REACH else None
+
+    def draw_box(self, box):
+        """在「处理后」一侧画红框；能拖的时候在四角和四边的中点画上白色小方块。"""
+        cv = self.canvases[1]
+        x0, y0, dw, dh = self.preview_geometry[1]
+        cv.delete("box")
+        cv.create_rectangle(x0 + box[0] * dw, y0 + box[1] * dh, x0 + box[2] * dw, y0 + box[3] * dh,
+                            outline="#e03131", tags="box")
+        if self.drag or self.box_editable():
+            for _handle, hx, hy in self.handle_points(box):
+                cv.create_rectangle(hx - HANDLE_HALF, hy - HANDLE_HALF, hx + HANDLE_HALF, hy + HANDLE_HALF,
+                                    fill="white", outline="#e03131", tags=("box", "handle"))
+
+    def update_cursor(self, x, y):
+        handle = self.drag[0] if self.drag else self.handle_at(x, y)
+        try:
+            self.canvases[1].configure(cursor=HANDLE_CURSORS[handle] if handle else "")
+        except tk.TclError:                 # 这几个光标名是 Windows 上的；别的平台没有就算了
+            pass
+
+    def on_canvas_press(self, slot, x, y):
+        handle = self.handle_at(x, y) if slot == 1 else None
+        if handle is None:
+            return self.show_loupe(slot, x, y)
+        self.drag = (handle, x, y, self.preview_data[2])
+        self.drag_box = self.preview_data[2]
+
+    def on_canvas_motion(self, slot, x, y):
+        if not self.drag:
+            return self.show_loupe(slot, x, y)
+        (xi, yi), px, py, start = self.drag
+        _x0, _y0, dw, dh = self.preview_geometry[1]
+        shift = self.preview_full[2] if self.preview_full else (0.0, 0.0)
+        box = list(start)
+        for edge, moved, offset in ((xi, (x - px) / dw, shift[0]), (yi, (y - py) / dh, shift[1])):
+            if edge is None:
+                continue
+            # 红框是画在平移之后的页面上的：换算回原来的位置不能出页面；也不能拖过对面那条边
+            value = min(max(start[edge] + moved, offset), 1.0 + offset)
+            opposite = start[(edge + 2) % 4]
+            box[edge] = min(value, opposite - MIN_BOX) if edge < 2 else max(value, opposite + MIN_BOX)
+        self.drag_box = tuple(box)
+        self.draw_box(self.drag_box)
+
+    def on_canvas_release(self, slot):
+        if not self.drag:
+            return self.hide_loupe()
+        (xi, yi), _px, _py, start = self.drag
+        box, self.drag, self.drag_box = self.drag_box, None, None
+        index = self.current_index()
+        if self.locked or self.ref is None or not self.infos or box == start:
+            return self.draw_preview()
+        # 记成和箭头微调一样的「四条边各自的移动量」：拖动的边按拖动量算，没动的边保持原来的
+        info = self.infos[index]
+        current = core.page_box(info, self.ref)
+        base = self.ref["boxes"].get(index, info.bbox)
+        offsets = list(self.adjust.get(index, (0.0, 0.0, 0.0, 0.0)))
+        for edge in (xi, yi):
+            if edge is not None:
+                offsets[edge] = current[edge] + (box[edge] - start[edge]) - base[edge]
+        offsets = tuple(0.0 if abs(o) < 1e-5 else round(o, 5) for o in offsets)
+        # 新的预览出来之前先按拖到的位置画着，免得红框跳回去再跳过来
+        self.preview_data = (*self.preview_data[:2], box, self.preview_data[3])
+        self.set_adjust(index, offsets)     # 画面不用重画：拖的时候已经画成这样了，小方块也留着，等新的预览来换
 
     # ------------------------------------------------------------ 放大镜
 
@@ -988,9 +1167,8 @@ class App(tk.Tk):
         self.log.configure(state="disabled")
 
     def _idle(self):
+        self.set_locked(False)
         self.btn_cancel.configure(state="disabled")
-        self.btn_reanalyze.configure(state="normal")
-        self.btn_run.configure(state="normal" if self.page_count else "disabled")
 
     def _poll(self):
         try:
@@ -1046,15 +1224,17 @@ class App(tk.Tk):
             self.write_log("错误: " + msg[1])
             messagebox.showerror("出错", msg[1])
         elif kind == "preview":
-            _, gen, before, after, box, status, deleted, full = msg
-            if gen == self.preview_gen:
+            _, gen, before, after, box, status, deleted, full, index = msg
+            if gen == self.preview_gen and not self.drag:       # 正拖着的时候不换图，松手后反正要重新预览
                 self.preview_data = (before, after, box, deleted)
+                self.preview_index, self.preview_shown_gen = index, gen
                 self.preview_full = full
                 self.lbl_page_status.configure(text=status)
                 self.draw_preview()
         elif kind == "estimate":
             _, gen, result, extra = msg
             if gen == self.estimate_gen:
+                self.estimate_running = False
                 if result is None:
                     self.lbl_estimate.configure(text="预计输出大小：无法预估（" + extra + "）")
                 else:

@@ -159,6 +159,15 @@ def test_box_adjust_and_neighbor():
     ref["adjust"] = {2: (-0.02, 0.0, 0.0, 0.0)}                               # 手动把左边框向左扩 2%
     f.close(pr.page_box(infos[2], ref)[0], 0.08, 1e-6, "手动微调后的左边")
     f.check(pr.page_box(infos[6], ref) == boxes[0], "微调只影响那一页")
+
+    # 调红框本身不移动页面；用户点了「版心居中」（ref["align"]）之后才按新的红框对齐
+    plain = pr.compute_shift(infos[2], pr.compute_reference(infos), False)
+    f.check(pr.compute_shift(infos[2], ref, False) == plain, "只调了红框、没点「版心居中」时，平移量不应变")
+    ref["align"] = {2: (-0.02, 0.0, 0.0, 0.0)}
+    f.close(pr.compute_shift(infos[2], ref, False)[0], plain[0] + 0.01, 1e-6, "点了「版心居中」后应按新的红框对齐")
+    ref["adjust"] = {2: (-0.06, 0.0, 0.0, 0.0)}                               # 居中之后又调了红框：对齐仍按居中那一刻的
+    f.close(pr.compute_shift(infos[2], ref, False)[0], plain[0] + 0.01, 1e-6, "居中之后再调红框，平移量不应跟着变")
+    f.close(pr.page_box(infos[2], ref)[0], 0.04, 1e-6, "红框本身跟着最新的微调")
     return f
 
 
@@ -382,6 +391,7 @@ def test_store_roundtrip():
     store.set_page_flag(book["id"], 1, "deleted", True)
     store.set_page_flag(book["id"], 0, "cleanup", True)
     store.set_box_adjust(book["id"], 2, (-0.02, 0, 0, 0.01))
+    store.set_box_adjust(book["id"], 2, (-0.02, 0, 0, 0), column="box_align")
     store.save_analysis(book["id"], infos, (opts.max_angle, opts.dpi))
     store.close()
 
@@ -396,6 +406,7 @@ def test_store_roundtrip():
     f.check(store.flagged_pages(book["id"], "skip") == {3} and store.flagged_pages(book["id"], "deleted") == {1}
             and store.flagged_pages(book["id"], "cleanup") == {0}, "逐页的开关应原样恢复")
     f.check(store.box_adjusts(book["id"]) == {2: (-0.02, 0, 0, 0.01)}, "版心微调应原样恢复")
+    f.check(store.box_adjusts(book["id"], "box_align") == {2: (-0.02, 0, 0, 0)}, "「版心居中」那一刻的红框应原样恢复")
     restored = store.load_analysis(book, (opts.max_angle, opts.dpi))
     same = lambda a, b: (a is None and b is None) or np.allclose(np.array(a, float).ravel(), np.array(b, float).ravel())
     f.check(restored is not None and len(restored) == len(infos), "分析结果应能取回")
@@ -428,10 +439,24 @@ def test_store_migrates_old_schema():
     db.close()
     store = Store(path)
     columns = {r["name"] for r in store.db.execute("PRAGMA table_info(pages)")}
-    f.check({"deleted", "cleanup", "box_adjust"} <= columns, f"旧数据库应自动补上新增的列，实际 {sorted(columns)}")
+    f.check({"deleted", "cleanup", "box_adjust", "box_align"} <= columns, f"旧数据库应自动补上新增的列，实际 {sorted(columns)}")
     f.check(store.flagged_pages(1, "skip") == {2}, "旧数据应保留")
     store.set_page_flag(1, 0, "cleanup", True)
     f.check(store.flagged_pages(1, "cleanup") == {0}, "升级后新的列应可以读写")
+    store.close()
+
+    # 有 box_adjust、还没有 box_align 的那一版：那时调了红框就自动按它对齐，升级后输出不应变
+    path = fresh_db("core_old_schema2.db")
+    Store(path).close()
+    db = sqlite3.connect(path)
+    db.executescript("""
+        ALTER TABLE pages DROP COLUMN box_align;
+        INSERT INTO books (fingerprint, path, page_count, created_at, updated_at) VALUES ('f', 'x.pdf', 3, 't', 't');
+        INSERT INTO pages (book_id, page_index, box_adjust) VALUES (1, 1, '[0.01, 0, 0, 0]');""")
+    db.commit()
+    db.close()
+    store = Store(path)
+    f.check(store.box_adjusts(1, "box_align") == {1: (0.01, 0, 0, 0)}, "旧版本调过红框的页，升级后应视为已经「版心居中」过")
     store.close()
     return f
 

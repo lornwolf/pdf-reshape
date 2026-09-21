@@ -502,8 +502,8 @@ def compute_reference(infos):
     return ref
 
 
-def page_box(info, ref):
-    """这一页对齐用的版心。
+def page_box(info, ref, key="adjust"):
+    """这一页的版心（界面预览里的红框）。
 
     ref["adjust"]（可选）是用户对个别页的手动微调 {页序: (左, 上, 右, 下 四条边各自的移动量)}，
     加在自动求出的版心上。它只影响这一页自己，不参与全书标准版心的统计——调一页不该带动别的页。
@@ -511,7 +511,7 @@ def page_box(info, ref):
     if not ref:
         return info.bbox
     box = ref["boxes"].get(info.index, info.bbox)
-    offsets = ref.get("adjust", {}).get(info.index)
+    offsets = ref.get(key, {}).get(info.index)
     if box and offsets:
         box = [min(max(b + o, 0.0), 1.0) for b, o in zip(box, offsets)]
         for lo, hi in ((0, 2), (1, 3)):                 # 两条边不能交叉，至少留 5% 的宽（高）
@@ -520,6 +520,13 @@ def page_box(info, ref):
                 box[lo], box[hi] = mid - 0.025, mid + 0.025
         box = tuple(box)
     return box
+
+
+def align_box(info, ref):
+    """这一页**对齐用的**版心。调红框本身不移动页面（用户要求：曾经每调一下页面就跟着重新对齐一次）；
+    用户点「版心居中」时，那一刻的红框记在 ref["align"] 里（格式同 ref["adjust"]），从此按它对齐。
+    之后再调红框，对齐仍按居中那一刻的，直到再点一次。去污、「与邻页相同」看的始终是红框（page_box）。"""
+    return page_box(info, ref, "align")
 
 
 def cleanup_box(info, ref):
@@ -614,7 +621,7 @@ def axis_shift(lo, hi, med_ext, edges, along_lines):
 
 
 def compute_shift(info, ref, per_page):
-    x0, y0, x1, y1 = page_box(info, ref)
+    x0, y0, x1, y1 = align_box(info, ref)
     if per_page or ref is None:
         return (1 - (x1 - x0)) / 2 - x0, (1 - (y1 - y0)) / 2 - y0
     own, other = ref[info.index % 2], ref[1 - info.index % 2]

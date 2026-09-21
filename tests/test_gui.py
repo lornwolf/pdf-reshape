@@ -116,10 +116,21 @@ def marks(d):
         d.click(app.nudge_buttons["←"])
     d.check(app.adjust == {2: (-0.02, 0.0, 0.0, 0.0)}, f"左边框左移 10 步应为 -2%，实际 {app.adjust}")
     yield d.previewed
-    d.check(d.status() != old_status and "x-2.8%" in d.status(), f"微调后应重新计算对齐（x-3.8% → x-2.8%），实际: {d.status()}")
+    d.check(d.status() == old_status, f"只调红框不应移动页面，状态应不变，实际: {d.status()}")
+    d.check("版心居中" in app.lbl_nudge.cget("text"), f"应提示还没有按新的红框居中，实际: {app.lbl_nudge.cget('text')}")
+    d.click(app.btn_center)                                     # 点了「版心居中」才按新的红框对齐
+    d.check(app.align == app.adjust and str(app.btn_center.cget("state")) == "disabled", "居中之后按钮不可用，直到红框再变")
+    yield d.previewed
+    d.check("x-2.8%" in d.status(), f"「版心居中」后应重新计算对齐（x-3.8% → x-2.8%），实际: {d.status()}")
+    d.click(app.nudge_buttons["←"])                             # 居中之后再调红框：页面仍然不动，按钮重新可用
+    yield d.previewed
+    d.check("x-2.8%" in d.status() and str(app.btn_center.cget("state")) == "normal", f"再调红框页面不应动，实际: {d.status()}")
+    d.click(app.nudge_buttons["→"])
+    d.check(app.adjust == app.align, "调回去之后应和居中时的红框一致")
 
     d.goto(6)                                                   # 半页的红框照前页的来
     d.click(app.btn_like_prev)
+    d.click(app.btn_center)
     d.check(d.frame_after(5) == d.frame_after(4), f"「与前页相同」后红框应与前页一致: {d.frame_after(5)} / {d.frame_after(4)}")
     d.check("去污 1 页: 1" in app.lbl_skipped.cget("text") and "删除 1 页: 2" in app.lbl_skipped.cget("text"),
             f"标记列表不对: {app.lbl_skipped.cget('text')}")
@@ -141,11 +152,15 @@ def marks_restore(d):
     d.check(app.infos is not None and not d.busy(), "有保存的分析结果时应直接恢复，不重新分析")
     d.check(app.skipped == {3} and app.deleted == {1} and app.cleanup == {0} and set(app.adjust) == {2, 5},
             f"逐页设定没有恢复: {app.skipped} {app.deleted} {app.cleanup} {sorted(app.adjust)}")
+    d.check(app.align == app.adjust, f"「版心居中」的结果没有恢复: {app.align}")
     d.check(bool(app.btn_reanalyze.winfo_manager()), "分析结果是从历史记录恢复的，应出现「重新分析」按钮")
     d.check(app.var_page.get() == 6, f"应回到上次看的页，实际第 {app.var_page.get()} 页")
     d.goto(3)
     d.click(app.btn_nudge_reset)
-    d.check(set(app.adjust) == {5} and str(app.btn_nudge_reset.cget("state")) == "disabled", "「复位」应撤销这一页的微调")
+    d.check(set(app.adjust) == {5} and set(app.align) == {5} and str(app.btn_nudge_reset.cget("state")) == "disabled",
+            "「复位」应同时撤销这一页的红框微调和手动居中")
+    yield d.previewed
+    d.check("x-3.8%" in d.status(), f"复位后应回到自动判断的对齐（x-3.8%），实际: {d.status()}")
     d.goto(2)
     d.click(app.btn_delete)
     d.check(app.deleted == set() and app.btn_delete.cget("text") == "删除当前页", "「恢复当前页」应取消删除")
@@ -283,6 +298,149 @@ def enhance(d):
     d.check((image[2], image[4]) == (3720, 1), f"输出应是 3 倍分辨率的 1bit 图，实际 {image[2:5]}")
 
 
+def lock(d):
+    """分析和处理期间：会改变输出的控件全部不可用，「取消」、翻页和预览照常；结束或取消之后恢复。"""
+    app = d.app
+    check_enhance = d.find_widget("TCheckbutton", None, text="显示增强")
+    spin_quality = d.find_widget("TSpinbox", app.var_quality)
+    entry_output = d.find_widget("TEntry", app.var_output)
+    btn_open = d.find_widget("TButton", None, text="打开…")
+
+    def state(w):
+        return str(w.cget("state"))
+
+    def editable():
+        return [state(w) for w in (check_enhance, spin_quality, entry_output, btn_open, app.btn_skip, app.btn_delete)]
+
+    d.open(fixtures()["h.pdf"])
+    d.check(d.busy() and editable() == ["disabled"] * 6, f"分析期间各项设置应不可用，实际 {editable()}")
+    d.check(state(app.btn_run) == "disabled" and state(app.btn_cancel) == "normal", "分析期间「开始处理」不可用、「取消」可用")
+    d.goto(2)                                                   # 分析期间也能翻页看暂定的预览
+    yield d.previewed
+    d.check(not d.busy() or editable() == ["disabled"] * 6, "分析期间翻页刷新之后仍应不可用")   # 测试用的书很小，可能已经分析完了
+    yield d.idle
+    d.check(editable() == ["normal"] * 6 and state(app.btn_run) == "normal", f"分析结束后应恢复，实际 {editable()}")
+    d.goto(3)
+    yield d.previewed
+    d.check(state(app.btn_cleanup) == "normal" and state(app.nudge_buttons["↑"]) == "normal", "分析完之后逐页的调整应可用")
+
+    passed = []
+    start_worker = app.start_worker
+    app.start_worker = lambda target, *args: (passed.append(args), start_worker(target, *args))
+    d.process_to("gui_lock_out.pdf")
+    app.start_worker = start_worker
+    d.check(d.busy(), "应已开始处理")
+    d.check(editable() == ["disabled"] * 6, f"处理期间各项设置应不可用，实际 {editable()}")
+    per_page = [app.btn_cleanup, app.btn_like_prev, app.btn_like_next, app.btn_run, *app.nudge_buttons.values()]
+    d.check(all(state(w) == "disabled" for w in per_page), "处理期间逐页的调整和「开始处理」应不可用")
+    d.check(state(app.btn_cancel) == "normal", "处理期间「取消」必须可用")
+    app.btn_skip.invoke()                                       # 不经过 d.click：它会处理事件，小书可能就在这时处理完、解了锁
+    app.btn_cleanup.invoke()
+    d.check(not app.skipped and not app.cleanup, "处理期间点不可用的按钮不应有任何效果")
+    ref = passed[0][2]
+    d.check(ref is not app.ref and ref["adjust"] is not app.adjust and ref["cleanup"] is not app.cleanup,
+            "交给处理线程的应是标准版心和逐页设定的副本，不能和界面共用")
+    d.goto(5)                                                   # 翻页、预览是只读的，照常可用
+    yield d.previewed
+    d.check("旋转" in d.status() or "平移" in d.status() or "无需" in d.status(), f"处理期间应能翻页预览，实际: {d.status()}")
+    d.check(not d.busy() or (state(app.btn_cleanup) == "disabled" and state(app.btn_skip) == "disabled"),
+            "翻页刷新之后仍应不可用")
+    yield d.processed
+    d.check(editable() == ["normal"] * 6, f"处理结束后各项设置应恢复，实际 {editable()}")
+    d.check(state(app.btn_cleanup) == "normal" and state(app.btn_run) == "normal" and state(app.btn_cancel) == "disabled",
+            "处理结束后逐页的调整、「开始处理」应恢复，「取消」不可用")
+    yield d.estimated
+
+    d.process_to("gui_lock_out2.pdf")                           # 取消之后也要恢复
+    d.check(editable() == ["disabled"] * 6, "再次处理时应再次锁住")
+    d.click(app.btn_cancel)
+    yield lambda: not d.busy() and state(app.btn_cancel) == "disabled"
+    d.check(editable() == ["normal"] * 6, f"取消之后各项设置应恢复，实际 {editable()}")
+
+    d.open(fixtures()["v.pdf"])                                 # 分析途中取消：也要恢复，否则界面就锁死了
+    d.check(editable() == ["disabled"] * 6, "打开另一本书、开始分析时应再次锁住")
+    d.click(app.btn_cancel)
+    yield lambda: not d.busy() and state(app.btn_cancel) == "disabled"
+    d.check(editable() == ["normal"] * 6 and state(app.btn_run) == "normal", f"取消分析之后应恢复，实际 {editable()}")
+    app.var_max_angle.set(6.0)                                  # 分析参数变了：点「开始处理」会先重新分析，全程锁住
+    d.process_to("gui_lock_out3.pdf")
+    d.check(app.pending_run is not None and editable() == ["disabled"] * 6, "重新分析 + 处理的期间应锁住")
+    yield d.processed
+    d.check(editable() == ["normal"] * 6, "分析 + 处理都结束后应恢复")
+
+
+def drag(d):
+    """用鼠标拖版心框：四角和四边中点各有一个小方块，拖角动相邻的两条边，拖边中点只动那一条边。"""
+    app = d.app
+    after = app.canvases[1]
+
+    def spot(handle):
+        """小方块在「处理后」画布上的位置。handle = (水平方向的边, 竖直方向的边)，None 表示中点。"""
+        return next((x, y) for h, x, y in app.handle_points(app.preview_data[2]) if h == handle)
+
+    def pull(handle, dx, dy):
+        """发真的鼠标事件：连同画布上的事件绑定一起测。"""
+        x, y = (round(v) for v in spot(handle))
+        after.event_generate("<ButtonPress-1>", x=x, y=y)
+        after.event_generate("<B1-Motion>", x=x + dx // 2, y=y + dy // 2)
+        after.event_generate("<B1-Motion>", x=x + dx, y=y + dy)
+        after.event_generate("<ButtonRelease-1>", x=x + dx, y=y + dy)
+        app.update()
+
+    d.open(fixtures()["h.pdf"])
+    d.check(not after.find_withtag("handle"), "分析完之前不应有可拖的小方块")
+    yield d.idle
+    d.goto(3)
+    yield d.previewed
+    d.check(len(after.find_withtag("handle")) == 8, f"红框上应有 8 个小方块，实际 {len(after.find_withtag('handle'))}")
+    d.check(not app.canvases[0].find_withtag("handle"), "「处理前」一侧没有红框，也不应有小方块")
+    dw, dh = app.preview_geometry[1][2:]
+
+    pull((2, None), 30, 17)                                     # 右边的中点：只动右边，竖直方向的移动不算
+    got = app.adjust.get(2)
+    d.check(got is not None and abs(got[2] - 30 / dw) < 0.002 and not any((got[0], got[1], got[3])),
+            f"拖右边中点应只把右边移动 {30 / dw:.4f}，实际 {got}")
+    yield d.previewed
+    d.check("右" in app.lbl_nudge.cget("text"), f"拖动的结果应和箭头微调一样显示出来，实际: {app.lbl_nudge.cget('text')}")
+    d.check(app.store.box_adjusts(app.book["id"]).get(2) == got, "拖动的结果应保存进数据库")
+
+    pull((0, 1), -20, -12)                                      # 左上角：左边和上边一起动，右边保持刚才的
+    now = app.adjust.get(2)
+    d.check(now is not None and abs(now[0] + 20 / dw) < 0.002 and abs(now[1] + 12 / dh) < 0.002
+            and abs(now[2] - got[2]) < 1e-6 and now[3] == 0, f"拖左上角应移动左边和上边，实际 {now}")
+    yield d.previewed
+
+    pull((2, None), -5000, 0)                                   # 把右边拖过左边：两条边不能交叉
+    yield d.previewed
+    box = d.core.page_box(app.infos[2], app.ref)
+    d.check(box[2] - box[0] >= 0.049, f"右边不能拖过左边，版心至少留 5% 宽，实际 {box[2] - box[0]:.3f}")
+    d.click(app.btn_nudge_reset)
+    yield d.previewed
+    d.check(2 not in app.adjust, "复位应清掉拖动的结果")
+
+    x, y = spot((None, 3))
+    app.on_canvas_press(1, x, y - 60)                           # 点在小方块以外的地方：还是放大镜
+    d.check(bool(after.find_withtag("loupe")) and app.drag is None, "点在小方块之外应显示放大镜")
+    app.on_canvas_release(1)
+    d.check(not after.find_withtag("loupe") and 2 not in app.adjust, "松开后放大镜消失，版心不变")
+
+    app.var_guides.set(False)                                   # 辅助线关掉就没有红框，也就不能拖
+    app.draw_preview()
+    d.check(not after.find_withtag("handle"), "关掉辅助线后不应有小方块")
+    app.var_guides.set(True)
+    app.draw_preview()
+
+    d.process_to("gui_drag_out.pdf")                            # 处理期间锁住：不能拖
+    if d.busy():
+        d.check(not after.find_withtag("handle"), "处理期间不应有可拖的小方块")
+        app.on_canvas_press(1, x, y)
+        d.check(app.drag is None, "处理期间不能拖版心框")
+        app.on_canvas_release(1)
+    yield d.processed
+    yield d.previewed
+    d.check(len(after.find_withtag("handle")) == 8, "处理结束后小方块应恢复")
+
+
 def files(d):
     """每本书的设置互不沿用；有记录的书恢复它自己的设置；改名的文件按内容认得；旧的默认输出名自动更新。"""
     app = d.app
@@ -383,6 +541,8 @@ SCENARIOS = [
     ("estimate", estimate, "gui_estimate.db", True, None),
     ("estimate_debounce", estimate_debounce, "gui_estimate_debounce.db", True, None),
     ("enhance", enhance, "gui_enhance.db", True, None),
+    ("lock", lock, "gui_lock.db", True, None),
+    ("drag", drag, "gui_drag.db", True, None),
     ("files", files, "gui_files.db", True, None),
     ("stale_analysis", stale_analysis, "gui_stale.db", True, prepare_stale),
     ("prune", prune, "gui_prune.db", True, prepare_prune),

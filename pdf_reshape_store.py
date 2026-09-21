@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS pages (
     deleted     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「删除当前页」（新 PDF 中不输出）
     cleanup     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「去除边缘污染」
     box_adjust  TEXT,                        -- 用户对版心四条边的手动微调 [左, 上, 右, 下]（JSON），没调过为 NULL
+    box_align   TEXT,                        -- 用户点「版心居中」那一刻的 box_adjust：对齐按它算，没点过为 NULL
     analysis    TEXT,                        -- 这一页的分析结果（PageInfo 的 JSON）
     PRIMARY KEY (book_id, page_index)
 );
@@ -101,6 +102,10 @@ class Store:
             self.db.execute("ALTER TABLE pages ADD COLUMN cleanup INTEGER NOT NULL DEFAULT 0")
         if "box_adjust" not in cols:
             self.db.execute("ALTER TABLE pages ADD COLUMN box_adjust TEXT")
+        if "box_align" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN box_align TEXT")
+            # 没有这一列的版本里，调了红框就自动按它对齐：照搬过来，升级后这些页的输出才不会变
+            self.db.execute("UPDATE pages SET box_align = box_adjust")
 
     def close(self):
         self.db.close()
@@ -185,20 +190,24 @@ class Store:
         rows = self.db.execute(f"SELECT page_index FROM pages WHERE book_id = ? AND {flag} = 1", (book_id,))
         return {r["page_index"] for r in rows}
 
-    def set_box_adjust(self, book_id, page_index, offsets):
+    BOX_COLUMNS = ("box_adjust", "box_align")      # 红框的手动微调、点「版心居中」那一刻的红框，格式相同
+
+    def set_box_adjust(self, book_id, page_index, offsets, column="box_adjust"):
         """保存某一页版心的手动微调；offsets 为 None 或全 0 表示复位。"""
+        assert column in self.BOX_COLUMNS
         value = json.dumps([round(o, 5) for o in offsets]) if offsets and any(offsets) else None
-        self.db.execute("""
-            INSERT INTO pages (book_id, page_index, box_adjust) VALUES (?, ?, ?)
-            ON CONFLICT (book_id, page_index) DO UPDATE SET box_adjust = excluded.box_adjust""",
+        self.db.execute(f"""
+            INSERT INTO pages (book_id, page_index, {column}) VALUES (?, ?, ?)
+            ON CONFLICT (book_id, page_index) DO UPDATE SET {column} = excluded.{column}""",
                         (book_id, page_index, value))
         self.db.execute("UPDATE books SET updated_at = ? WHERE id = ?", (_now(), book_id))
         self.db.commit()
 
-    def box_adjusts(self, book_id):
+    def box_adjusts(self, book_id, column="box_adjust"):
+        assert column in self.BOX_COLUMNS
         rows = self.db.execute(
-            "SELECT page_index, box_adjust FROM pages WHERE book_id = ? AND box_adjust IS NOT NULL", (book_id,))
-        return {r["page_index"]: tuple(json.loads(r["box_adjust"])) for r in rows}
+            f"SELECT page_index, {column} AS box FROM pages WHERE book_id = ? AND {column} IS NOT NULL", (book_id,))
+        return {r["page_index"]: tuple(json.loads(r["box"])) for r in rows}
 
     def save_analysis(self, book_id, infos, params):
         """保存全书的分析结果。用户的手动调整（skip）原样保留。"""

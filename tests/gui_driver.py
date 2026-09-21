@@ -156,15 +156,17 @@ class Driver:
         sx, sy = self.core.compute_shift(info, self.app.ref, False)
         return [round(box[0] + sx, 3), round(box[1] + sy, 3), round(box[2] + sx, 3), round(box[3] + sy, 3)]
 
-    def find_widget(self, widget_class, variable):
-        """按控件类型和绑定的变量找控件（比如「小于此角度不旋转」的数值框）。"""
+    def find_widget(self, widget_class, variable, text=None):
+        """按控件类型和绑定的变量找控件（比如「小于此角度不旋转」的数值框）；没有绑定变量的按文字开头找。"""
         stack = [self.app]
         while stack:
             w = stack.pop()
             stack.extend(w.winfo_children())
-            if w.winfo_class() == widget_class and str(w.cget("textvariable")) == str(variable):
+            if w.winfo_class() != widget_class:
+                continue
+            if str(w.cget("text")).startswith(text) if text else str(w.cget("textvariable")) == str(variable):
                 return w
-        raise LookupError(f"找不到绑定 {variable} 的 {widget_class}")
+        raise LookupError(f"找不到绑定 {variable or text} 的 {widget_class}")
 
     def press(self, widget, key):
         widget.focus_force()
