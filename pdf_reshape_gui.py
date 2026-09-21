@@ -16,11 +16,14 @@ from tkinter import filedialog, messagebox, ttk
 
 import cv2
 import fitz
+import numpy as np
 
 import pdf_reshape as core
 from pdf_reshape_store import Store
 
 PREVIEW_MAX_SIDE = 1600   # 预览用图像的长边上限（像素）
+LOUPE_SIZE = 300          # 放大镜的边长（屏幕像素）
+LOUPE_SPAN = 0.07         # 放大镜里显示页面宽度的 7%
 NUDGE_STEP = 0.002        # 版心边框每按一次移动页面宽（高）的 0.2%
 ESTIMATE_DELAY = 800      # 设置变了之后等这么久（毫秒）再重新预估输出大小
 NUDGE_ESTIMATE_DELAY = 2000   # 调版心边框时等得更久：停手 2 秒之后才重新预估
@@ -46,7 +49,10 @@ class App(tk.Tk):
         self.preview_gen = 0               # 预览请求序号，用来丢弃过期结果
         self.preview_data = None           # (before, after, box, 本页是否已删除)
         self.preview_after_id = None
+        self.preview_full = None           # (处理前, 处理后, 平移量)：原尺寸的图，放大镜用
+        self.preview_geometry = [None, None]   # 两个预览画布上页面图像的位置 (x0, y0, 宽, 高)
         self.photos = [None, None]
+        self.loupe_photos = [None, None]
         self.book = None                   # 数据库里这本书的记录
         self.skipped = set()               # 用户指定「本页不修正」的页（从 0 开始）
         self.deleted = set()               # 用户指定「删除当前页」的页：新 PDF 中不输出
@@ -107,11 +113,13 @@ class App(tk.Tk):
         self.var_per_page = tk.BooleanVar(value=False)
         self.var_clean = tk.BooleanVar(value=False)
         self.var_upscale = tk.BooleanVar(value=False)
+        self.var_enhance = tk.BooleanVar(value=False)
         for text, var in [("倾斜校正", self.var_deskew),
                           ("版心居中", self.var_center),
                           ("每页各自居中\n（不参照全书标准版心）", self.var_per_page),
                           ("版心外涂成纸色\n（去黑边、阴影）", self.var_clean),
-                          ("黑白页旋转时 2 倍分辨率\n（笔画更平滑，体积变大）", self.var_upscale)]:
+                          ("黑白页旋转时 2 倍分辨率\n（笔画更平滑，体积变大）", self.var_upscale),
+                          ("显示增强\n（只增强能明显改善的页）", self.var_enhance)]:
             ttk.Checkbutton(box, text=text, variable=var,
                             command=self.schedule_preview).pack(anchor="w", **pad)
 
@@ -232,7 +240,10 @@ class App(tk.Tk):
             cv = tk.Canvas(panes, background="#808080", highlightthickness=0)
             cv.grid(row=1, column=c, sticky="nsew", padx=2)
             cv.bind("<Configure>", lambda e: self.draw_preview())
-            cv.bind("<Button-1>", lambda e: e.widget.focus_set())   # 点一下预览图，方向键就回来翻页
+            # 点一下预览图，方向键就回来翻页；按住不放是放大镜（两边同时放大同一处，对比增强前后）
+            cv.bind("<ButtonPress-1>", lambda e, c=c: (e.widget.focus_set(), self.show_loupe(c, e.x, e.y)))
+            cv.bind("<B1-Motion>", lambda e, c=c: self.show_loupe(c, e.x, e.y))
+            cv.bind("<ButtonRelease-1>", lambda e: self.hide_loupe())
             self.canvases.append(cv)
         # 键盘翻页：PageUp/PageDown、上下左右方向键、Home/End
         for key, delta in (("<Prior>", -1), ("<Next>", 1), ("<Up>", -1), ("<Down>", 1),
@@ -265,7 +276,7 @@ class App(tk.Tk):
         return core.Options(
             deskew=self.var_deskew.get(), center=self.var_center.get(),
             per_page=self.var_per_page.get(), clean_margin=self.var_clean.get(),
-            upscale=self.var_upscale.get(),
+            upscale=self.var_upscale.get(), enhance=self.var_enhance.get(),
             max_angle=max(num(self.var_max_angle, 5.0, float), 0.5),
             min_angle=max(num(self.var_min_angle, 0.1, float), 0.0),
             dpi=min(max(num(self.var_dpi, 300, int), 72), 1200),
@@ -281,6 +292,7 @@ class App(tk.Tk):
         self.rec = {name: rec[name] for name in ("max_angle", "min_angle", "quality", "dpi")}
         for line in rec["lines"]:
             self.write_log(line)
+        self.write_log(core.enhancement_summary(self.infos))
         self.update_recommend_label()
 
     # (参数名, 名称, 单位, 是否「安静」)。安静的参数只在有事可做时才显示提示——
@@ -340,7 +352,7 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 进度的保存与恢复
 
-    OPTION_VARS = ("deskew", "center", "per_page", "clean", "upscale",
+    OPTION_VARS = ("deskew", "center", "per_page", "clean", "upscale", "enhance",
                    "max_angle", "min_angle", "quality", "dpi")
 
     def save_state(self):
@@ -598,7 +610,7 @@ class App(tk.Tk):
             indices = core.parse_pages(self.var_pages.get().strip(), self.page_count)
         except ValueError:
             return
-        key = (self.analysis_key, opts.deskew, opts.center, opts.per_page, opts.clean_margin, opts.upscale,
+        key = (self.analysis_key, opts.deskew, opts.center, opts.per_page, opts.clean_margin, opts.upscale, opts.enhance,
                opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices),
                tuple(sorted(self.adjust.items())), frozenset(self.cleanup))
         if key == self.estimate_key or not indices:
@@ -879,15 +891,17 @@ class App(tk.Tk):
                 if provisional:                # 全书分析还没结束：先单独分析这一页
                     info = core.analyze_page(doc, index, opts)
                 before, after, box, status = core.preview_page(doc, info, ref, opts, skip)
-            scale = PREVIEW_MAX_SIDE / max(before.shape[:2])
-            if scale < 1:
-                before = cv2.resize(before, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                after = cv2.resize(after, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                shift = core.plan_page(info, ref, opts, skip)[1]
             if deleted:
                 after, box, status = before, None, "本页已删除，不会输出到新 PDF"
             elif provisional and not opts.per_page and not skip:
                 status += "  ※全书分析完成前为暂定结果"
-            self.msgs.put(("preview", gen, before, after, box, status, deleted))
+            full = (before, after, (0.0, 0.0) if deleted else shift)     # 原尺寸的图：放大镜用
+
+            def fit(img):
+                scale = PREVIEW_MAX_SIDE / max(img.shape[:2])
+                return cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else img
+            self.msgs.put(("preview", gen, fit(before), fit(after), box, status, deleted, full))
         except Exception as e:
             self.msgs.put(("preview_error", gen, f"{type(e).__name__}: {e}"))
 
@@ -906,6 +920,7 @@ class App(tk.Tk):
             ok, png = cv2.imencode(".png", small)
             self.photos[slot] = tk.PhotoImage(data=base64.b64encode(png.tobytes()))
             x0, y0 = (cw - dw) // 2, (ch - dh) // 2
+            self.preview_geometry[slot] = (x0, y0, dw, dh)
             cv.delete("all")
             cv.create_image(x0, y0, anchor="nw", image=self.photos[slot])
             if self.var_guides.get():
@@ -922,6 +937,45 @@ class App(tk.Tk):
                                     fill="#d00000", outline="")
                 cv.create_text(x0 + dw / 2, y0 + dh / 2, text="已删除 · 不输出", fill="white",
                                font=("Microsoft YaHei UI", 14, "bold"))
+
+    # ------------------------------------------------------------ 放大镜
+
+    def show_loupe(self, slot, x, y):
+        """在两个预览画布上同时放大同一处内容。整页缩到窗口大小时，显示增强的效果是看不出来的。"""
+        if not (self.preview_full and self.preview_geometry[slot]):
+            return
+        before, after, shift = self.preview_full
+        x0, y0, dw, dh = self.preview_geometry[slot]
+        u, v = (x - x0) / dw, (y - y0) / dh                 # 鼠标指着页面的什么位置（0~1）
+        if not (0 <= u <= 1 and 0 <= v <= 1):
+            return self.hide_loupe()
+        # 处理后的内容挪动过：左边要往回找，两边才是同一处（旋转的那一点差别忽略）
+        if slot == 1:
+            spots = ((u - shift[0], v - shift[1]), (u, v))
+        else:
+            spots = ((u, v), (u + shift[0], v + shift[1]))
+        for k, (img, (pu, pv)) in enumerate(zip((before, after), spots)):
+            h, w = img.shape[:2]
+            half = max(int(LOUPE_SPAN * w / 2), 8)
+            cx, cy = int(np.clip(pu * w, half, w - half)), int(np.clip(pv * h, half, h - half))
+            crop = img[cy - half:cy + half, cx - half:cx + half]
+            crop = cv2.resize(crop, (LOUPE_SIZE, LOUPE_SIZE),
+                              interpolation=cv2.INTER_NEAREST if 2 * half < LOUPE_SIZE else cv2.INTER_AREA)
+            ok, png = cv2.imencode(".png", crop)
+            self.loupe_photos[k] = tk.PhotoImage(data=base64.b64encode(png.tobytes()))
+            gx, gy, gw, gh = self.preview_geometry[k]
+            px = int(np.clip(gx + spots[k][0] * gw - LOUPE_SIZE / 2 if k != slot else x - LOUPE_SIZE / 2,
+                             0, max(self.canvases[k].winfo_width() - LOUPE_SIZE, 0)))
+            py = int(np.clip(gy + spots[k][1] * gh - LOUPE_SIZE / 2 if k != slot else y - LOUPE_SIZE / 2,
+                             0, max(self.canvases[k].winfo_height() - LOUPE_SIZE, 0)))
+            cv = self.canvases[k]
+            cv.delete("loupe")
+            cv.create_image(px, py, anchor="nw", image=self.loupe_photos[k], tags="loupe")
+            cv.create_rectangle(px, py, px + LOUPE_SIZE, py + LOUPE_SIZE, outline="#2a7fff", width=2, tags="loupe")
+
+    def hide_loupe(self):
+        for cv in self.canvases:
+            cv.delete("loupe")
 
     # ------------------------------------------------------------ 消息处理
 
@@ -992,9 +1046,10 @@ class App(tk.Tk):
             self.write_log("错误: " + msg[1])
             messagebox.showerror("出错", msg[1])
         elif kind == "preview":
-            _, gen, before, after, box, status, deleted = msg
+            _, gen, before, after, box, status, deleted, full = msg
             if gen == self.preview_gen:
                 self.preview_data = (before, after, box, deleted)
+                self.preview_full = full
                 self.lbl_page_status.configure(text=status)
                 self.draw_preview()
         elif kind == "estimate":

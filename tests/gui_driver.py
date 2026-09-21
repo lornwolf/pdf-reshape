@@ -145,7 +145,8 @@ class Driver:
         return self.app.log.get("1.0", "end").strip()
 
     def options(self):
-        names = ("deskew", "center", "per_page", "clean", "upscale", "max_angle", "min_angle", "quality", "dpi")
+        names = ("deskew", "center", "per_page", "clean", "upscale", "enhance",
+                 "max_angle", "min_angle", "quality", "dpi")
         return {n: getattr(self.app, "var_" + n).get() for n in names}
 
     def frame_after(self, index):

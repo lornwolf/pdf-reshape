@@ -8,6 +8,7 @@ import os
 import sqlite3
 import sys
 
+import cv2
 import fitz
 import numpy as np
 
@@ -122,6 +123,22 @@ def test_skip_delete_cleanup():
     return f
 
 
+def test_skip_page_can_still_be_cleaned():
+    """「本页不修正」管的是位置，不挡「去除边缘污染」（曾经点了没反应）。"""
+    f = Failures()
+    out, infos, _ = process("h.pdf", "core_skip_cleanup_out.pdf", ref_extra={"cleanup": {3}}, skip_pages={3, 6})
+    pages = measure(out)
+    f.close(abs(pages[3]["angle"]), 3.8, 0.11, "不修正 + 去污的页：位置和倾斜应保持不动")
+    edge = page_array(out, 3)
+    f.check(edge[:8].min() > 200 and edge[:, :8].min() > 200, "不修正 + 去污的页：黑边应被去掉")
+    original, kept = page_array(fixtures()["h.pdf"], 3), page_array(out, 3)
+    inside = (slice(60, -60), slice(60, -60))               # 版心里的内容应和原页一样（只差 JPEG 重存的细微误差）
+    f.check(np.abs(original[inside].astype(int) - kept[inside].astype(int)).mean() < 2, "位置不动时内容应与原页一致")
+    other = page_array(out, 6)                              # 只是不修正、没指定去污的页：原样保留
+    f.check(min(other[:8].min(), other[:, :8].min(), other[-8:].min()) < 100, "只指定不修正的页应原样保留（黑边还在）")
+    return f
+
+
 def test_remap_toc():
     f = Failures()
     toc = [[1, "封面", 1], [1, "第一章", 3], [2, "1.1", 4], [1, "第二章", 7], [1, "附录", 8]]
@@ -193,6 +210,118 @@ def test_jpeg_block_aligned_shift():
     out = pr.transform_image(img, info, 0.0, (0.0123, -0.0177), False)
     y, x = np.argwhere(out == 255)[0]
     f.check((x - 200 + 3) % 8 == 0 and (y - 200 + 5) % 8 == 0, f"平移量 ({x - 200}, {y - 200}) 没有对齐到编码块")
+    return f
+
+
+# ---------------------------------------------------------------- 显示增强
+
+def mask_page(index=2):
+    """合成的 150 DPI 黑白页（二值图）。"""
+    doc, infos, opts = analyzed(fixtures()["mask.pdf"])
+    return pr.to_gray(pr.load_page_image(doc, doc[index], infos[index], opts.dpi))
+
+
+def test_enhancement_is_only_for_pages_that_benefit():
+    f = Failures()
+    low = mask_page()
+    f.check(pr.assess_enhancement(low, 150) == "smooth3", f"150 DPI 的文字页应放大平滑，实际 {pr.assess_enhancement(low, 150)!r}")
+    high = cv2.resize(low, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+    f.check(pr.assess_enhancement(high, 300) == "", "分辨率够、又干净的页不值得增强")
+
+    dusty = high.copy()                                     # 在空白处撒上 275 个孤立的小灰尘
+    for y in range(40, 240, 40):
+        for x in range(120, 2320, 40):
+            dusty[y:y + 2, x:x + 2] = 0
+    f.check(pr.assess_enhancement(dusty, 300) == "clean", f"灰尘多的页应去噪点，实际 {pr.assess_enhancement(dusty, 300)!r}")
+
+    picture = high.copy()                                   # 一大块抖动出来的网点图（占页面 15% 以上）
+    yy, xx = np.mgrid[0:1200, 0:1600]
+    picture[1200:2400, 400:2000] = np.where((yy + xx) % 2 == 0, 0, 255)
+    f.check(pr.assess_enhancement(picture, 150) == "", "以网点图为主的页不应增强")
+
+    title = np.full((1754, 1240), 255, np.uint8)            # 只有几个大字的扉页
+    cv2.putText(title, "TITLE", (120, 800), cv2.FONT_HERSHEY_SIMPLEX, 9, 0, 40, cv2.LINE_AA)
+    title = cv2.threshold(title, 127, 255, cv2.THRESH_BINARY)[1]
+    f.check(pr.assess_enhancement(title, 150) == "vector", f"以大字为主的页应矢量化，实际 {pr.assess_enhancement(title, 150)!r}")
+    return f
+
+
+def test_find_noise_only_touches_what_is_safe():
+    f = Failures()
+    bw = np.full((400, 400), 255, np.uint8)
+    bw[50:110, 50:110] = 0;   bw[80, 80] = 255              # 粗笔画里的一个小孔 → 该填
+    bw[200:204, 60:64] = 0;   bw[201:203, 61:63] = 255      # 细笔画围起来的小空白（字形里的圈）→ 不动
+    bw[300:302, 300:302] = 0                                # 空白处孤立的小点 → 该去
+    bw[112:114, 80:82] = 0                                  # 紧挨着笔画的小点（可能是浊点）→ 不动
+    yy, xx = np.mgrid[0:70, 0:70]
+    bw[250:320, 50:120] = np.where((yy + xx) % 2 == 0, 0, 255)   # 网点图案 → 整块不动
+    specks, holes = pr.find_noise(bw, 300)
+    f.check(holes[80, 80], "粗笔画里的小孔应被认出来")
+    f.check(not holes[201:203, 61:63].any(), "细笔画围起来的空白不应被当成小孔")
+    f.check(specks[300:302, 300:302].all(), "孤立的小点应被认出来")
+    f.check(not specks[112:114, 80:82].any(), "紧挨着笔画的小点不应被当成噪点")
+    f.check(not specks[250:320, 50:120].any() and not holes[250:320, 50:120].any(), "网点图案里的点和孔都不应被动")
+    return f
+
+
+def test_vector_page_matches_bitmap():
+    f = Failures()
+    bw = np.full((600, 600), 255, np.uint8)
+    cv2.circle(bw, (300, 300), 200, 0, -1)
+    cv2.circle(bw, (300, 300), 80, 255, -1)                 # 环：中间的孔要保持是空的
+    cv2.rectangle(bw, (40, 40), (140, 100), 0, -1)          # 直角要保持是尖的
+    doc = fitz.open()
+    page = pr.add_output_page(doc, fitz.Rect(0, 0, 300, 300), bw, pr.PageInfo(index=0, bilevel=True), pr.Options(), "vector")
+    f.check(not page.get_images(), "矢量化的页不应含图像")
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), colorspace=fitz.csGRAY)
+    got = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width) < 128
+    want = bw < 128
+    overlap = (got & want).sum() / (got | want).sum()
+    f.check(overlap > 0.985, f"矢量化之后的形状应与原图吻合，重合度只有 {overlap:.3f}")
+    f.check(not got[295:305, 295:305].any(), "环中间的孔应保持是空的")
+    return f
+
+
+def test_upscale_does_not_disturb_unrotated_clean_page():
+    """只去噪点、不旋转的页不放大；「2 倍分辨率」开着时，曾把原尺寸的图当成放大过的去平滑、去噪点。"""
+    f = Failures()
+    doc, infos, _ = analyzed(fixtures()["mask.pdf"])
+    ref = pr.compute_reference(infos)
+    info = infos[2]
+    info.enhance = "clean"
+    plain, _ = pr.render_page(doc, info, ref, pr.Options(enhance=True), 0.0, (0.0, 0.0))
+    both, _ = pr.render_page(doc, info, ref, pr.Options(enhance=True, upscale=True), 0.0, (0.0, 0.0))
+    f.check(both.shape == plain.shape, f"不旋转的页不应放大，实际 {both.shape} / {plain.shape}")
+    if both.shape == plain.shape:
+        changed = int((both != plain).sum())
+        f.check(changed == 0, f"不旋转的页勾不勾「2 倍分辨率」应完全一样，实际有 {changed} 个像素不同")
+    rotated, _ = pr.render_page(doc, info, ref, pr.Options(enhance=True, upscale=True), 0.5, (0.0, 0.0))
+    f.check(rotated.shape[0] == 2 * plain.shape[0], "旋转的页仍应以 2 倍分辨率输出")
+    return f
+
+
+def test_enhance_output():
+    f = Failures()
+    doc, infos, _ = analyzed(fixtures()["mask.pdf"])
+    opts = pr.Options(enhance=True)
+    ref = pr.compute_reference(infos)
+    out = work_path("core_enhance_out.pdf")
+    pr.process_document(doc, infos, opts, out, ref=ref, skip_pages={1})
+    result = fitz.open(out)
+    image = result[0].get_images(full=True)[0]
+    f.check((image[2], image[3], image[4]) == (3720, 5262, 1), f"增强的页应是 3 倍分辨率的 1bit 图，实际 {image[2:5]}")
+    image = result[1].get_images(full=True)[0]
+    f.check((image[2], image[3]) == (1240, 1754), "「本页不修正」的页不应被增强")
+    for i, m in enumerate(measure(out), 1):
+        if i != 2:
+            f.close(m["angle"], 0, 0.11, f"第 {i} 页的残余倾斜")
+    estimate = pr.estimate_output_size(doc, infos, ref, opts, skip_pages={1})[0]
+    actual = os.path.getsize(out)
+    f.check(abs(estimate - actual) <= 0.12 * actual, f"增强后的大小预估 {estimate} 与实际 {actual} 相差超过 12%")
+
+    doc, infos, _ = analyzed(fixtures()["h.pdf"])            # 灰度页：这三种方法都不适用
+    f.check(not any(p.enhance for p in infos) and "只对黑白二值页有效" in pr.enhancement_summary(infos),
+            "灰度/彩色的页不应被选中")
     return f
 
 

@@ -79,6 +79,13 @@ def marks(d):
     d.goto(4)
     d.click(app.btn_skip)
     d.check(app.btn_skip.cget("text") == "恢复本页修正" and app.skipped == {3}, "「本页不修正」按下后应改名并记下这一页")
+    d.click(app.btn_cleanup)                                    # 不修正的页也可以去污（曾经点了没反应）
+    yield d.previewed
+    d.check("本页不修正" in d.status() and "去除边缘污染" in d.status(), f"状态栏应同时注明两者，实际: {d.status()}")
+    before, after, box = app.preview_data[0], app.preview_data[1], app.preview_data[2]
+    d.check(before[:30, :30].min() < 60 and after[:30, :30].min() > 200, "不修正的页去污后，预览里黑边应消失")
+    d.check(box is not None, "不修正的页也应画出红框（去污是按红框算的）")
+    d.click(app.btn_cleanup)                                    # 取消，后面的检查照旧
     d.goto(5)
     d.check(app.btn_skip.cget("text") == "本页不修正", "翻到别的页，按钮应回到那一页的状态")
 
@@ -248,6 +255,34 @@ def estimate_debounce(d):
     yield d.estimated
 
 
+def enhance(d):
+    """显示增强：只增强值得增强的页；放大镜；处理输出。"""
+    app = d.app
+    d.open(fixtures()["mask.pdf"])
+    yield d.idle
+    d.check("「显示增强」" in d.log() and "平滑放大 ×3 8 页" in d.log(), f"分析完应说明有多少页值得增强: {d.log()[-200:]}")
+    d.goto(3)
+    yield d.previewed
+    d.check("显示增强" not in d.status(), "没勾选时不应增强")
+    app.var_enhance.set(True)
+    d.refresh()
+    yield d.previewed
+    d.check("显示增强: 平滑放大 ×3" in d.status(), f"状态栏应注明用了什么方法，实际: {d.status()}")
+    before, after, _ = app.preview_full
+    d.check(after.shape[1] == 3 * before.shape[1], f"增强后的图应是 3 倍分辨率: {before.shape} → {after.shape}")
+    x0, y0, w, h = app.preview_geometry[1]
+    app.show_loupe(1, x0 + w // 2, y0 + h // 2)             # 放大镜：两边同时放大同一处
+    app.update()
+    d.check(all(cv.find_withtag("loupe") for cv in app.canvases), "按住预览图时两边都应出现放大镜")
+    app.hide_loupe()
+    d.check(not any(cv.find_withtag("loupe") for cv in app.canvases), "松开后放大镜应消失")
+    yield d.estimated
+    out = d.process_to("gui_enhance_out.pdf")
+    yield d.processed
+    image = fitz.open(out)[2].get_images(full=True)[0]
+    d.check((image[2], image[4]) == (3720, 1), f"输出应是 3 倍分辨率的 1bit 图，实际 {image[2:5]}")
+
+
 def files(d):
     """每本书的设置互不沿用；有记录的书恢复它自己的设置；改名的文件按内容认得；旧的默认输出名自动更新。"""
     app = d.app
@@ -347,6 +382,7 @@ SCENARIOS = [
     ("recommend_quiet", recommend_quiet, "gui_recommend_quiet.db", True, None),
     ("estimate", estimate, "gui_estimate.db", True, None),
     ("estimate_debounce", estimate_debounce, "gui_estimate_debounce.db", True, None),
+    ("enhance", enhance, "gui_enhance.db", True, None),
     ("files", files, "gui_files.db", True, None),
     ("stale_analysis", stale_analysis, "gui_stale.db", True, prepare_stale),
     ("prune", prune, "gui_prune.db", True, prepare_prune),

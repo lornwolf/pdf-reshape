@@ -17,6 +17,7 @@ import bisect
 import math
 import struct
 import sys
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +25,7 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-ANALYSIS_VERSION = 3        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
+ANALYSIS_VERSION = 4        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
 ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
 FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
 HANGING_TOLERANCE = 0.03    # 全部内容比标准的正文宽出这么多，才认为有东西（页码、页眉）挂在正文外面
@@ -48,6 +49,7 @@ class PageInfo:
     core_bbox: tuple | None = None  # 只算成块内容（文字行、插图）的版心；见 effective_boxes
     outliers: list | None = None    # 伸出核心版心之外的小块 [(x0, y0, x1, y1), ...]：页码、序号，也可能是污渍
     dense_bbox: tuple | None = None  # 按墨迹密度求出的正文范围 (x0, y0, x1, y1)；见 dense_extent
+    enhance: str = ""           # 「显示增强」对这一页适合用的方法，空 = 增强了也没有明显改善；见 assess_enhancement
     scan_rect: tuple = (0.0, 0.0, 1.0, 1.0)  # 扫描图在页面中的范围（归一化）
     # 以下两项每次 load_page_image 时重新填写，不依赖保存下来的分析结果
     jpeg_block: int = 0         # 原图是 JPEG 时，它的编码块大小（灰度 8、彩色 16）；不是 JPEG 为 0
@@ -62,6 +64,7 @@ class Options:
     per_page: bool = False      # 每页各自居中（不参照全书标准版心）
     clean_margin: bool = False  # 把版心以外涂成纸色
     upscale: bool = False       # 黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）
+    enhance: bool = False       # 显示增强：对能有明显改善的黑白页，自动选合适的方法增强显示效果
     max_angle: float = 5.0      # 倾斜检测范围 ±度
     min_angle: float = 0.1      # 小于此角度不旋转
     dpi: int = 300              # 无法直接取原图的页面的渲染 DPI
@@ -639,7 +642,9 @@ def remove_margin_stains(img, rect, bilevel):
         return img
     f = 4                                               # 纸面的明暗变化很平缓，缩小 4 倍算，快 16 倍
     small = cv2.resize(img, (max(w // f, 1), max(h // f, 1)), interpolation=cv2.INTER_AREA)
-    k = max(int(0.06 * min(small.shape[:2])) | 1, 9)    # 能填平宽度在页面 6% 以内的黑边
+    # 核的半径要明显大于黑边的宽度，最靠边的像素才够得着里面的纸色：12% 的核能填平宽度在页面
+    # 5% 以内、笔直贴着页边的黑边（6% 的核对 3% 宽的黑边刚好差一两列像素，没旋转的页上露过馅）
+    k = max(int(0.12 * min(small.shape[:2])) | 1, 9)
     paper = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
     paper = cv2.resize(cv2.GaussianBlur(paper, (k, k), 0), (w, h), interpolation=cv2.INTER_LINEAR)
     stain = (to_gray(paper).astype(np.int16) - to_gray(img).astype(np.int16)) > 24
@@ -648,7 +653,8 @@ def remove_margin_stains(img, rect, bilevel):
     return img
 
 
-def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, cleanup=None):
+def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, cleanup=None, keep_scale=False,
+                    nearest=False):
     """对整页图像做「旋转 + 平移」。scale > 1 时同时放大输出（见 Options.upscale）。
 
     不需要旋转的页只做整像素平移、不插值，像素原样搬运，完全无损。
@@ -662,7 +668,8 @@ def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, c
     bg = np.median(img[::8, ::8].reshape(-1, 1 if img.ndim == 2 else 3), axis=0)
     bg = tuple(float(v) for v in bg)
     if angle == 0.0:
-        scale, interp = 1, cv2.INTER_NEAREST
+        # 不旋转就不用放大（放大是为了减轻旋转带来的毛刺）；keep_scale 是「显示增强」要的放大，照做
+        scale, interp = (scale, cv2.INTER_CUBIC) if keep_scale and scale > 1 else (1, cv2.INTER_NEAREST)
         dx, dy = round(dx), round(dy)
         if info.jpeg_block:
             b, (gx, gy) = info.jpeg_block, info.grid
@@ -674,6 +681,8 @@ def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, c
     m[0, 2] += (scale - 1) * w / 2 + scale * dx
     m[1, 2] += (scale - 1) * h / 2 + scale * dy
     w, h = w * scale, h * scale
+    if nearest:                                 # 最近邻：每个像素原样变大，不产生新的灰度（保护网点图案用）
+        interp = cv2.INTER_NEAREST
     out = cv2.warpAffine(img, m, (w, h), flags=interp,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
     if clean_margin:
@@ -692,6 +701,226 @@ def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, c
                 min(int((cleanup[2] + shift[0] + pad) * w), w), min(int((cleanup[3] + shift[1] + pad) * h), h))
         out = remove_margin_stains(out, rect, info.bilevel)
     return out
+
+
+# ---------------------------------------------------------------- 显示增强
+
+SMOOTH_BELOW_DPI = 240      # 分辨率低于此的黑白页值得放大平滑：正常阅读的缩放比例下就能看到锯齿
+NOISE_MIN = 120             # 噪点 + 小孔至少这么多，并且不少于字数的 8%，才值得清理
+HALFTONE_MAX = 0.10         # 网点图案占到页面的 10% 以上：这一页以图为主，整页不增强（小块的图案只是局部让开）
+
+
+def _speck_limit(dpi):
+    """多大的成分算噪点（面积，像素）。180 DPI 下 2 个像素，随分辨率的平方放大；
+    定得很保守：标点、浊点、注音假名的笔画都比它大。"""
+    return max(2, round(2 * (dpi / 180) ** 2))
+
+
+def pattern_regions(ink, dpi, scale=1):
+    """网点图案的区域（布尔掩码）：抖动出来的页码花饰、插图。特征是噪点大小的小点、小孔密集成片。
+    这些地方做什么增强都是帮倒忙：孔被填上成了死黑，点被当成噪点抹掉，平滑把网点糊成一团。"""
+    limit = 4 * _speck_limit(dpi) * scale * scale
+    tiny = np.zeros(ink.shape, np.float32)
+    for binary, connectivity in ((ink, 8), (1 - ink, 4)):
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=connectivity)
+        small = stats[:, cv2.CC_STAT_AREA] <= limit
+        small[0] = False
+        tiny[small[labels]] = 1
+    window = (max(round(dpi / 6) * scale, 15) | 1,) * 2
+    dense = cv2.boxFilter(tiny, -1, window) > 0.03
+    return cv2.dilate(dense.astype(np.uint8), np.ones(window, np.uint8)).astype(bool)
+
+
+def find_noise(bw, dpi, scale=1):
+    """找出可以放心清掉的杂质，返回 (噪点的掩码, 小孔的掩码)。bw 是二值图，scale 是它相对原图放大的倍数。
+
+    光看大小不行：浊点、标点、字母 i 上的点和灰尘一样小；注音假名「あ」「ぬ」里的小圈和笔画上的
+    缺损一样小。清错了字就更难认。所以只认两种十拿九稳的：
+    - 噪点：够小，而且**孤立**——周围一圈之内没有任何别的墨迹。紧挨着字的小点一律不动。
+    - 小孔：够小，而且**四周被厚厚的墨迹包着**——粗笔画里面的缺损。被细笔画围起来的空白是字形
+      本身，不动。
+    另外，小点、小孔**密集成片**的地方是网点图案（抖动出来的页码花饰、插图），整块都不动：
+    那些孔是图案的一部分，填掉就成了一块死黑。实测真实的扫描书里绝大多数「小孔」都属于这种。
+    """
+    ink = (bw < 128).astype(np.uint8)
+    limit = _speck_limit(dpi) * scale * scale
+    reach = max(4, round(dpi / 40)) * scale                     # 噪点周围这么远之内不能有别的墨迹
+    wall = 2 * scale                                            # 小孔四周的墨迹至少这么厚
+
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    small = stats[:, cv2.CC_STAT_AREA] <= limit
+    small[0] = False
+    specks = small[labels]
+    n_w, white_labels, white_stats, _ = cv2.connectedComponentsWithStats(1 - ink, connectivity=4)
+    small_w = white_stats[:, cv2.CC_STAT_AREA] <= limit
+    small_w[0] = False
+    holes = small_w[white_labels]
+
+    pattern = pattern_regions(ink, dpi, scale)                  # 网点图案整块保护起来
+    specks &= ~np.isin(labels, np.unique(labels[specks & pattern]))
+    holes &= ~np.isin(white_labels, np.unique(white_labels[holes & pattern]))
+
+    others = (ink.astype(bool) & ~specks).astype(np.uint8)
+    near = cv2.dilate(others, np.ones((2 * reach + 1,) * 2, np.uint8)).astype(bool)
+    crowded = np.unique(labels[specks & near])                  # 旁边有字的小点：可能是笔画的一部分
+    specks &= ~np.isin(labels, crowded)
+
+    labels = white_labels
+    ring = cv2.dilate(holes.astype(np.uint8), np.ones((2 * wall + 1,) * 2, np.uint8)).astype(bool) & ~holes
+    thin = cv2.dilate((ring & ~ink.astype(bool)).astype(np.uint8), np.ones((2 * wall + 1,) * 2, np.uint8)).astype(bool)
+    holes &= ~np.isin(labels, np.unique(labels[holes & thin]))  # 包着它的墨迹不够厚：是字形里的空白
+    return specks, holes
+
+
+def assess_enhancement(gray, dpi):
+    """判断一张黑白二值页做「显示增强」有没有明显的改善、适合用哪种方法。
+
+    返回方法的组合（用 + 连接），空字符串表示不值得增强：
+    - "smooth2" / "smooth3"：放大 2 / 3 倍、平滑、重新二值化。给分辨率低的页：台阶状的笔画边缘变平滑。
+      分辨率够的页不做——正常阅读时看不出区别，文件却要大几倍。
+    - "clean"：去掉孤立的噪点、填上粗笔画里的小孔（见 find_noise）。给杂质多的页。**不做「接断笔」**：
+      汉字笔画密，分辨率低的时候「接上断笔」和「把两笔粘在一起」只差一个像素。
+    - "vector"：把轮廓转成平滑的曲线，任意放大都没有锯齿。只给以大字、线条为主的页（扉页、标题页）：
+      小字的点阵轮廓本来就不准，矢量化之后有「融化」的感觉，曲线的数据量也太大。
+    带网点图（抖动出来的照片、花饰）的页一律不增强：网点会被当成噪点抹掉、被平滑糊成一团。
+    """
+    ink = (gray < 128).astype(np.uint8)
+    h, w = ink.shape
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+    if n < 2:
+        return ""
+    area, height = stats[1:, cv2.CC_STAT_AREA], stats[1:, cv2.CC_STAT_HEIGHT]
+    limit = _speck_limit(dpi)
+
+    if float(pattern_regions(ink, dpi).mean()) > HALFTONE_MAX:
+        return ""
+
+    glyphs = int(((height >= 6) & (height <= 0.2 * h) & (area >= 12)).sum())
+    specks, holes = find_noise(gray, dpi)                       # 只数真的会被清掉的那些
+    noise = (cv2.connectedComponents(specks.astype(np.uint8), connectivity=8)[0] - 1
+             + cv2.connectedComponents(holes.astype(np.uint8), connectivity=4)[0] - 1)
+    big = height > 0.04 * h
+    components = int((area > limit).sum())
+    if components and area[big].sum() >= 0.6 * area.sum() and components < 600:
+        return "vector"
+    methods = []
+    if glyphs >= 50 and dpi < SMOOTH_BELOW_DPI:
+        methods.append("smooth3" if dpi < 200 else "smooth2")
+    if noise >= NOISE_MIN and noise >= 0.08 * glyphs:
+        methods.append("clean")
+    return "+".join(methods)
+
+
+def enhancement_of(info, opts, skip=False):
+    """这一页实际要做的增强：选项开着、这一页值得增强、用户没有指定「本页不修正」。"""
+    return info.enhance if opts.enhance and info.bilevel and not skip and info.mode != "copy" else ""
+
+
+def enhancement_scale(method):
+    return 3 if "smooth3" in method else 2 if ("smooth2" in method or "vector" in method) else 1
+
+
+ENHANCE_NAMES = {"smooth2": "平滑放大 ×2", "smooth3": "平滑放大 ×3", "clean": "去噪点", "vector": "矢量化"}
+
+
+def describe_enhancement(method):
+    return "、".join(ENHANCE_NAMES[m] for m in method.split("+")) if method else ""
+
+
+def enhance_bitmap(img, method, scale, dpi, plain=None):
+    """对已经变换（放大）好的黑白页做增强，返回二值图。plain 是同一页用最近邻放大的版本。"""
+    gray = to_gray(img)
+    bw = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)[1]
+    if scale > 1:
+        # 放大之后轻轻糊一下再划黑白：台阶变成平滑的曲线。网点图案的区域让开，用最近邻放大的版本——
+        # 三次插值会把规则的网点拉成斜纹
+        smooth = cv2.threshold(cv2.GaussianBlur(gray, (0, 0), 0.45 * scale), 127, 255, cv2.THRESH_BINARY)[1]
+        plain = bw if plain is None else cv2.threshold(to_gray(plain), 127, 255, cv2.THRESH_BINARY)[1]
+        pattern = pattern_regions((plain < 128).astype(np.uint8), dpi, scale)
+        bw = np.where(pattern, plain, smooth)
+    if "clean" in method:
+        specks, holes = find_noise(bw, dpi, scale)
+        bw[specks] = 255
+        bw[holes] = 0
+    return bw
+
+
+def vector_stream(bw, width, height):
+    """把二值图里的墨迹轮廓转成 PDF 的路径（内容流）。width/height 是页面的尺寸（点）。
+
+    轮廓先略作简化，再用 Catmull-Rom 样条换算成三次贝塞尔曲线；拐角（转角小于 120°）处不加
+    切线，保持尖角。所有轮廓（外轮廓和里面的孔）放进同一个路径，用奇偶规则填充，孔自然是空的。
+    """
+    contours, _ = cv2.findContours(255 - bw, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+    sx, sy = width / bw.shape[1], height / bw.shape[0]
+    parts = ["0 g"]
+    for contour in contours:
+        pts = cv2.approxPolyDP(contour, 0.6, True).reshape(-1, 2).astype(float)
+        if len(pts) < 3:
+            continue
+        pts = np.column_stack([pts[:, 0] * sx, height - pts[:, 1] * sy])
+        prev, nxt = np.roll(pts, 1, axis=0), np.roll(pts, -1, axis=0)
+        a, b = pts - prev, nxt - pts
+        cos = (a * b).sum(axis=1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-12)
+        tangent = (nxt - prev) / 6
+        tangent[cos < 0.5] = 0                                   # 转角小于 120° 的是真的拐角，不圆滑
+        c1, c2 = pts + tangent, nxt - np.roll(tangent, -1, axis=0)
+        parts.append(f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} m")
+        parts.extend(f"{c1[i, 0]:.2f} {c1[i, 1]:.2f} {c2[i, 0]:.2f} {c2[i, 1]:.2f} {nxt[i, 0]:.2f} {nxt[i, 1]:.2f} c"
+                     for i in range(len(pts)))
+        parts.append("h")
+    parts.append("f*")
+    return "\n".join(parts).encode("ascii")
+
+
+def render_page(doc, info, ref, opts, angle, shift, skip=False):
+    """取图、变换、增强，得到这一页最终的图像。返回 (图像, 实际用的增强方法)。"""
+    method = enhancement_of(info, opts, skip)
+    grow = enhancement_scale(method)                             # 增强本身要的放大，旋转不旋转都照做
+    scale = max(grow, 2 if opts.upscale and info.bilevel else 1)
+    if angle == 0.0:
+        # 不旋转的页 transform_image 不理会「2 倍分辨率」，出来的图只放大了 grow 倍。这里要跟着改，
+        # 否则只去噪点的页会把原尺寸的图当成放大过的：白白糊一遍，噪点的尺寸上限也大了 4 倍
+        scale = grow
+    source = load_page_image(doc, doc[info.index], info, opts.dpi)
+    # 不修正的页不受全局的「版心外涂成纸色」影响；它只接受用户逐页指定的去污
+    kwargs = dict(scale=scale, bbox=content_box(info, ref), cleanup=cleanup_box(info, ref), keep_scale=grow > 1)
+    img = transform_image(source, info, angle, shift, opts.clean_margin and not skip, **kwargs)
+    if method:
+        plain = None
+        if scale > 1:
+            plain = transform_image(source, info, angle, shift, opts.clean_margin and not skip, nearest=True, **kwargs)
+        img = enhance_bitmap(img, method, scale, info.dpi, plain)
+    return img, method
+
+
+def add_output_page(out, rect, img, info, opts, method):
+    """把一页写进输出的 PDF：矢量化的页写成路径，其余的写成图像。"""
+    page = out.new_page(width=rect.width, height=rect.height)
+    if "vector" in method:
+        xref = out.get_new_xref()
+        out.update_object(xref, "<<>>")
+        out.update_stream(xref, vector_stream(img, rect.width, rect.height))
+        page.set_contents(xref)
+    else:
+        page.insert_image(page.rect, keep_proportion=False, stream=encode_image(img, info.bilevel, opts.quality))
+    return page
+
+
+def enhancement_summary(infos):
+    """分析完之后的一句话：全书有多少页值得增强、各用什么方法。"""
+    bilevel = [p for p in infos if p.bbox and p.bilevel]
+    if not bilevel:
+        return "「显示增强」只对黑白二值页有效，本书没有这样的页。"
+    chosen = [p.enhance for p in bilevel if p.enhance]
+    if not chosen:
+        return f"「显示增强」：{len(bilevel)} 页黑白页都已经足够清楚（或带网点图），增强不会有明显的改善。"
+    counts = {}
+    for method in chosen:
+        for m in method.split("+"):
+            counts[ENHANCE_NAMES[m]] = counts.get(ENHANCE_NAMES[m], 0) + 1
+    detail = "，".join(f"{name} {n} 页" for name, n in counts.items())
+    return f"「显示增强」：{len(bilevel)} 页黑白页里有 {len(chosen)} 页可以明显改善（{detail}）。"
 
 
 def encode_image(img, bilevel, quality):
@@ -719,7 +948,10 @@ def analyze_page(doc, index, opts):
         return info
     if info.mode == "native":
         info.bilevel = doc.extract_image(info.xref).get("bpc") == 1
-    analyze(load_page_image(doc, page, info, opts.dpi), info, opts.max_angle)
+    img = load_page_image(doc, page, info, opts.dpi)
+    analyze(img, info, opts.max_angle)
+    if info.bbox and info.bilevel:
+        info.enhance = assess_enhancement(to_gray(img), info.dpi)
     return info
 
 
@@ -935,9 +1167,13 @@ def format_recommendation(infos, profile=None, max_angle=5.0):
 def plan_page(info, ref, opts, skip=False):
     """根据分析结果和选项，决定这一页实际要做的旋转角度和平移量。
 
-    skip 表示用户指定了「本页不修正」：原样复制，但它的分析结果仍然参与全书标准版心的统计。
+    skip 表示用户指定了「本页不修正」：不旋转、不平移，但它的分析结果仍然参与全书标准版心的统计。
+    「不修正」管的是位置，不挡「去除边缘污染」：封面、插图页这类不想让程序挪动的页恰恰常有黑边。
+    同时指定了去污的页不能原样复制，而是位置不动（像素原样搬运）、只去污。
     """
     if skip:
+        if cleanup_box(info, ref) is not None:
+            return 0.0, (0.0, 0.0), False, "本页不修正（手动指定）  去除边缘污染"
         return 0.0, (0.0, 0.0), True, "本页不修正（手动指定）"
     angle = info.angle if opts.deskew and abs(info.angle) >= opts.min_angle else 0.0
     shift = (0.0, 0.0)
@@ -945,12 +1181,14 @@ def plan_page(info, ref, opts, skip=False):
         shift = compute_shift(info, ref, opts.per_page)
     trivial = angle == 0.0 and max(abs(shift[0]), abs(shift[1])) < 0.003
     cleanup = cleanup_box(info, ref) is not None
-    untouched = info.mode == "copy" or (trivial and not opts.clean_margin and not cleanup)
+    method = enhancement_of(info, opts)
+    untouched = info.mode == "copy" or (trivial and not opts.clean_margin and not cleanup and not method)
     if untouched:
         status = info.note or "无需修正"
     else:
         status = (f"旋转 {angle:+.2f}°  平移 x{shift[0] * 100:+.1f}% y{shift[1] * 100:+.1f}%"
                   + ("  去除边缘污染" if cleanup else "")
+                  + (f"  显示增强: {describe_enhancement(method)}" if method else "")
                   + (f"  ({info.note})" if info.note else ""))
     return angle, shift, untouched, status
 
@@ -983,13 +1221,8 @@ def process_document(doc, infos, opts, output, progress=None, log=None, cancelle
         if untouched:
             out.insert_pdf(doc, from_page=info.index, to_page=info.index)
         else:
-            img = load_page_image(doc, page, info, opts.dpi)
-            img = transform_image(img, info, angle, shift, opts.clean_margin,
-                                  scale=2 if opts.upscale and info.bilevel else 1,
-                                  bbox=content_box(info, ref), cleanup=cleanup_box(info, ref))
-            new_page = out.new_page(width=page.rect.width, height=page.rect.height)
-            new_page.insert_image(new_page.rect, keep_proportion=False,
-                                  stream=encode_image(img, info.bilevel, opts.quality))
+            img, method = render_page(doc, info, ref, opts, angle, shift, skip=info.index in skip_pages)
+            add_output_page(out, page.rect, img, info, opts, method)
             changed += 1
         if log:
             log(f"[{k}/{len(infos)}] 第 {info.index + 1} 页: {status}")
@@ -1009,6 +1242,10 @@ def page_source_bytes(doc, page):
     """这一页内嵌图像在原 PDF 里占的字节数（压缩后的流长度）。"""
     total = 0
     for item in page.get_images(full=True):
+        if doc.xref_get_key(item[0], "Filter")[0] == "null":
+            # 没压缩过的流：输出保存时会顺带压缩它，按压缩之后的大小算（否则原样复制的页会被高估好几倍）
+            total += len(zlib.compress(doc.xref_stream_raw(item[0]), 6))
+            continue
         kind, value = doc.xref_get_key(item[0], "Length")
         if kind == "int":
             total += int(value)
@@ -1045,11 +1282,13 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
     # 旋转的页和只平移的页分开抽样、分开算比例：只平移的页（尤其是块对齐的 JPEG）重存后几乎
     # 不变大，旋转的页要大三到五成，混在一起抽样，预估会随两类页的比例飘
     total, n_sampled = copied_bytes + 1500 * copied, 0
-    groups = [[w for w in work if w[1] == 0.0], [w for w in work if w[1] != 0.0]]
-    for group in groups:
-        if not group:
-            continue
-        n = min(len(group), max(4, round(samples * len(group) / len(work))))
+    # 做了显示增强的页（放大 2、3 倍，或者变成矢量）和别的页也不是一个比例，同样要分开
+    groups = {}
+    for item in work:
+        skip = item[0].index in skip_pages
+        groups.setdefault((item[1] == 0.0, enhancement_of(item[0], opts, skip)), []).append(item)
+    for group in groups.values():
+        n = min(len(group), max(3, round(samples * len(group) / len(work))))
         step = len(group) / n
         picked = sorted({int(k * step) for k in range(n)})
         tmp = fitz.open()
@@ -1057,18 +1296,17 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
             if cancelled and cancelled():
                 raise Cancelled
             info, angle, shift, src = group[j]
-            scale = 2 if opts.upscale and info.bilevel else 1
-            key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4),
-                   opts.clean_margin, scale, None if info.bilevel else opts.quality, opts.dpi,
-                   cleanup_box(info, ref))
-            if key not in cache:
-                img = load_page_image(doc, doc[info.index], info, opts.dpi)
-                img = transform_image(img, info, angle, shift, opts.clean_margin, scale=scale,
-                                      bbox=content_box(info, ref), cleanup=cleanup_box(info, ref))
-                cache[key] = encode_image(img, info.bilevel, opts.quality)
-            rect = doc[info.index].rect
-            tmp.new_page(width=rect.width, height=rect.height).insert_image(
-                fitz.Rect(0, 0, rect.width, rect.height), stream=cache[key], keep_proportion=False)
+            skip = info.index in skip_pages
+            key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4), opts.clean_margin,
+                   opts.upscale, None if info.bilevel else opts.quality, opts.dpi, cleanup_box(info, ref),
+                   enhancement_of(info, opts, skip), skip)
+            if key not in cache:                    # 缓存一页单独存成 PDF 的字节，多次预估之间复用
+                single = fitz.open()
+                img, method = render_page(doc, info, ref, opts, angle, shift, skip=skip)
+                add_output_page(single, doc[info.index].rect, img, info, opts, method)
+                cache[key] = single.tobytes(garbage=3, deflate=True)
+            with fitz.open("pdf", cache[key]) as single:
+                tmp.insert_pdf(single)
 
         sampled_src = sum(group[j][3] for j in picked)
         sampled_out = len(tmp.tobytes(garbage=3, deflate=True))    # 已含这几页的 PDF 结构开销
@@ -1108,13 +1346,20 @@ def preview_page(doc, info, ref, opts, skip=False):
     angle, shift, untouched, status = plan_page(info, ref, opts, skip)
     render_info = info if info.mode != "copy" else PageInfo(index=info.index, mode="render")
     before = load_page_image(doc, page, render_info, 100 if info.mode == "copy" else opts.dpi)
-    after = before if untouched else transform_image(
-        before, info, angle, shift, opts.clean_margin, scale=2 if opts.upscale and info.bilevel else 1,
-        bbox=content_box(info, ref), cleanup=cleanup_box(info, ref))
-    if info.bilevel and not untouched:      # 预览也按实际输出那样二值化，所见即所得
-        after = cv2.threshold(to_gray(after), 127, 255, cv2.THRESH_BINARY)[1]
+    if untouched:
+        after = before
+    else:
+        after, method = render_page(doc, info, ref, opts, angle, shift, skip=skip)
+        if "vector" in method:              # 矢量化的页：把实际写出来的那一页渲染成图，所见即所得
+            with fitz.open() as tmp:
+                zoom = after.shape[1] / page.rect.width
+                pix = add_output_page(tmp, page.rect, after, info, opts, method).get_pixmap(
+                    matrix=fitz.Matrix(zoom, zoom), colorspace=fitz.csGRAY)
+                after = pixmap_to_array(pix)
+        elif info.bilevel:                  # 预览也按实际输出那样二值化
+            after = cv2.threshold(to_gray(after), 127, 255, cv2.THRESH_BINARY)[1]
     box = None
-    if info.bbox and not untouched:
+    if info.bbox:       # 不动的页（不修正、无需修正）也画出红框：去污是按红框算的，得让用户先看到它
         b = page_box(info, ref)
         box = (b[0] + shift[0], b[1] + shift[1], b[2] + shift[0], b[3] + shift[1])
     return before, after, box, status
@@ -1153,13 +1398,15 @@ def main():
     ap.add_argument("--per-page", action="store_true",
                     help="每页各自居中（默认会参照全书标准版心，避免半页内容跑到页面中间）")
     ap.add_argument("--clean-margin", action="store_true", help="把版心以外涂成纸色（去黑边、阴影）")
+    ap.add_argument("--enhance", action="store_true",
+                    help="显示增强：对能有明显改善的黑白页，自动选合适的方法（平滑放大、去噪点、矢量化）")
     ap.add_argument("--upscale", action="store_true",
                     help="黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）")
     args = ap.parse_args()
 
     output = args.output or default_output_path(args.input)
     opts = Options(deskew=not args.no_deskew, center=not args.no_center, per_page=args.per_page,
-                   clean_margin=args.clean_margin, upscale=args.upscale, max_angle=args.max_angle,
+                   clean_margin=args.clean_margin, upscale=args.upscale, enhance=args.enhance, max_angle=args.max_angle,
                    min_angle=args.min_angle or 0.0, dpi=args.dpi, quality=args.quality or 90)
     doc = fitz.open(args.input)
     indices = parse_pages(args.pages, doc.page_count)
@@ -1171,6 +1418,7 @@ def main():
     rec = format_recommendation(infos, source_profile(doc, infos), opts.max_angle)
     for line in rec["lines"]:
         print(line)
+    print(enhancement_summary(infos))
     if args.min_angle is None:
         opts.min_angle = rec["min_angle"] if rec["min_angle"] is not None else 0.1
         print(f"未指定 --min-angle，采用 {opts.min_angle}°")
