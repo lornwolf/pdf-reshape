@@ -209,6 +209,45 @@ def estimate(d):
     d.check(abs(estimated - actual) <= 0.1 * actual, f"预估 {estimated:.0f} 与实际 {actual} 相差超过 10%")
 
 
+def estimate_debounce(d):
+    """连着点版心边框的箭头时不重新预估大小，停手 2 秒之后才算一次。"""
+    import time
+    app = d.app
+    d.open(fixtures()["h.pdf"])
+    yield d.estimated
+    d.goto(3)
+    yield d.previewed
+    starts = []
+    original = app.start_estimate
+
+    def spy(opts, indices):
+        starts.append(time.monotonic())
+        original(opts, indices)
+    app.start_estimate = spy
+    app.var_edge.set("左")
+    app.update_nudge_buttons()
+    for _ in range(4):                              # 每隔 1 秒点一下：比普通设置 0.8 秒的延迟长，但不到 2 秒
+        d.click(app.nudge_buttons["←"])
+        last_click = time.monotonic()
+        d.check("调整结束后重新计算" in app.lbl_estimate.cget("text"), "点击后应提示稍后重新计算")
+        yield 1000
+    d.check(not starts, f"连续点击期间不应重新预估，实际算了 {len(starts)} 次")
+    yield lambda: bool(starts) or time.monotonic() - last_click > 6
+    d.check(len(starts) == 1, f"停手之后应只预估 1 次，实际 {len(starts)} 次")
+    if starts:
+        waited = starts[0] - last_click
+        d.check(1.9 <= waited <= 3.5, f"应在最后一次点击约 2 秒后开始预估，实际 {waited:.1f} 秒")
+    yield d.estimated
+    d.check(app.lbl_estimate.cget("text").startswith("预计输出约"), "算完后应显示新的预估值")
+    starts.clear()
+    app.var_quality.set(60)                         # 别的设置变了，还是按 0.8 秒的延迟
+    changed = time.monotonic()
+    d.refresh()
+    yield lambda: bool(starts) or time.monotonic() - changed > 6
+    d.check(bool(starts) and starts[0] - changed < 1.8, "JPEG 质量变了应按普通的延迟（0.8 秒）重新预估")
+    yield d.estimated
+
+
 def files(d):
     """每本书的设置互不沿用；有记录的书恢复它自己的设置；改名的文件按内容认得；旧的默认输出名自动更新。"""
     app = d.app
@@ -307,6 +346,7 @@ SCENARIOS = [
     ("recommend", recommend, "gui_recommend.db", True, None),
     ("recommend_quiet", recommend_quiet, "gui_recommend_quiet.db", True, None),
     ("estimate", estimate, "gui_estimate.db", True, None),
+    ("estimate_debounce", estimate_debounce, "gui_estimate_debounce.db", True, None),
     ("files", files, "gui_files.db", True, None),
     ("stale_analysis", stale_analysis, "gui_stale.db", True, prepare_stale),
     ("prune", prune, "gui_prune.db", True, prepare_prune),

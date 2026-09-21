@@ -8,6 +8,7 @@ import base64
 import queue
 import sys
 import threading
+import time
 from datetime import datetime
 import tkinter as tk
 from pathlib import Path
@@ -21,6 +22,8 @@ from pdf_reshape_store import Store
 
 PREVIEW_MAX_SIDE = 1600   # 预览用图像的长边上限（像素）
 NUDGE_STEP = 0.002        # 版心边框每按一次移动页面宽（高）的 0.2%
+ESTIMATE_DELAY = 800      # 设置变了之后等这么久（毫秒）再重新预估输出大小
+NUDGE_ESTIMATE_DELAY = 2000   # 调版心边框时等得更久：停手 2 秒之后才重新预估
 EDGES = {"上": 1, "下": 3, "左": 0, "右": 2}       # 边 → 版心 (左, 上, 右, 下) 里的下标
 
 
@@ -53,6 +56,7 @@ class App(tk.Tk):
         self.estimate_key = None           # 上次预估时的全部相关设置；没变就不重算
         self.estimate_cache = {}           # 抽样页的编码结果，多次预估之间复用
         self.estimate_after_id = None
+        self.nudged_at = 0.0               # 最近一次调版心边框的时刻（time.monotonic）
         try:
             self.store = Store()
         except Exception as e:             # 数据库打不开也不影响整形本身，只是不能保存进度
@@ -476,7 +480,20 @@ class App(tk.Tk):
         if self.store and self.book:
             self.store.set_box_adjust(self.book["id"], index, offsets)
         self.update_nudge_buttons()
+        self.hold_estimate()
         self.schedule_preview()              # 重新计算这一页的对齐并刷新显示（连按时合并成一次）
+
+    def hold_estimate(self):
+        """调版心边框往往要连着点很多下。预估输出大小要抽十几页真的处理一遍，每点一下就算一遍会把
+        程序拖慢：所以点的时候先把排队中的、正在算的都停掉，等停手 2 秒之后再算（见 schedule_estimate）。"""
+        self.nudged_at = time.monotonic()
+        if self.estimate_after_id:
+            self.after_cancel(self.estimate_after_id)
+            self.estimate_after_id = None
+        self.estimate_gen += 1               # 正在算的那一次看到序号变了就会中止
+        self.estimate_key = None
+        if self.lbl_estimate.cget("text"):
+            self.lbl_estimate.configure(text="预计输出大小：调整结束后重新计算…")
 
     def update_delete_button(self, deleted):
         self.btn_delete.configure(text="恢复当前页" if deleted else "删除当前页",
@@ -589,7 +606,9 @@ class App(tk.Tk):
         self.estimate_key = key
         if self.estimate_after_id:
             self.after_cancel(self.estimate_after_id)
-        self.estimate_after_id = self.after(800, lambda: self.start_estimate(opts, indices))
+        nudging = time.monotonic() - self.nudged_at < NUDGE_ESTIMATE_DELAY / 1000
+        delay = NUDGE_ESTIMATE_DELAY if nudging else ESTIMATE_DELAY
+        self.estimate_after_id = self.after(delay, lambda: self.start_estimate(opts, indices))
 
     def start_estimate(self, opts, indices):
         self.estimate_after_id = None
