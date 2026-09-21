@@ -27,6 +27,7 @@ import numpy as np
 ANALYSIS_VERSION = 3        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
 ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
 FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
+HANGING_TOLERANCE = 0.03    # 全部内容比标准的正文宽出这么多，才认为有东西（页码、页眉）挂在正文外面
 OVERSIZE_TOLERANCE = 0.025  # 版心比标准版心大出这么多，才怀疑它是被空白处的杂质撑大的
 EDGE_MATCH_TOLERANCE = 0.03  # 半页的版心边缘与同类页相差在此以内，才认为是同一条版心边
 FLUSH_RATIO = 0.35          # 略窄的页：一边离标准版心的距离不到另一边的这个比例，就认为这一边是对齐的、缩进全在另一边
@@ -484,11 +485,12 @@ def compute_reference(infos):
                 box[lo], box[hi] = p.dense_bbox[lo], p.dense_bbox[hi]
             boxes[p.index] = tuple(box)
     # 按密度求出的正文范围只用来**去掉伸到正文外面的东西**（外挂的页码、页眉、污渍），也就是只在
-    # 全部内容比标准的正文宽时才用。内容没有超宽的页直接用全部内容：整行的文字只有寥寥几行的页
+    # 全部内容比标准的正文明显宽时才用（门槛 3%：外挂的页码至少伸出去 5%；而「标准」是按密度求的，
+    # 行尾参差不齐的书里它本来就比实际内容窄一点，门槛定在 2% 会误伤正常的页）。其余的页直接用全部内容：整行的文字只有寥寥几行的页
     # （诗歌、对话、字表、目录），整行所在的列达不到「叠了很多行」的门槛，求出来的范围会偏窄
     standard = _reference_of(sorted(boxes.items()), infos)["ext"][0 if lo == 0 else 1]
     for index, whole in content.items():
-        if whole[hi] - whole[lo] <= standard + FULL_PAGE_TOLERANCE:
+        if whole[hi] - whole[lo] <= standard + HANGING_TOLERANCE:
             box = list(boxes[index])
             box[lo], box[hi] = whole[lo], whole[hi]
             boxes[index] = tuple(box)
@@ -498,8 +500,69 @@ def compute_reference(infos):
 
 
 def page_box(info, ref):
-    """这一页对齐用的版心。"""
-    return ref["boxes"].get(info.index, info.bbox) if ref else info.bbox
+    """这一页对齐用的版心。
+
+    ref["adjust"]（可选）是用户对个别页的手动微调 {页序: (左, 上, 右, 下 四条边各自的移动量)}，
+    加在自动求出的版心上。它只影响这一页自己，不参与全书标准版心的统计——调一页不该带动别的页。
+    """
+    if not ref:
+        return info.bbox
+    box = ref["boxes"].get(info.index, info.bbox)
+    offsets = ref.get("adjust", {}).get(info.index)
+    if box and offsets:
+        box = [min(max(b + o, 0.0), 1.0) for b, o in zip(box, offsets)]
+        for lo, hi in ((0, 2), (1, 3)):                 # 两条边不能交叉，至少留 5% 的宽（高）
+            if box[hi] - box[lo] < 0.05:
+                mid = (box[lo] + box[hi]) / 2
+                box[lo], box[hi] = mid - 0.025, mid + 0.025
+        box = tuple(box)
+    return box
+
+
+def cleanup_box(info, ref):
+    """用户对这一页指定了「去除边缘污染」时，返回它的红框（对齐用的版心），否则返回 None。
+
+    和手动微调一样挂在 ref 上：ref["cleanup"] 是指定了去污的页序集合。
+    """
+    if ref and info.bbox and info.mode != "copy" and info.index in ref.get("cleanup", ()):
+        return page_box(info, ref)
+    return None
+
+
+def box_like_neighbor(info, neighbor, ref):
+    """「与前页/后页相同」：算出让这一页的红框和邻页一样所需要的手动微调量 (左, 上, 右, 下)。
+
+    不能直接照搬邻页红框的坐标：左右页的版心在扫描图上本来就差几个百分点，每一页的扫描位置
+    还有 1% 多的抖动。所以分三步：
+    1. 取邻页的红框（含它自己的手动微调）——要的是它的**大小**；
+    2. 邻页和本页可能分属左右页，按全书统计的左右页位置差平移过来；
+    3. 平移后如果有一条边和本页自动检测到的边很接近（差 3% 以内），整体挪过去贴齐那条边，
+       把扫描位置的抖动消掉。两条边都对不上就保持第 2 步的结果，留给用户用箭头微调。
+    """
+    target = list(page_box(neighbor, ref))
+    auto = ref["boxes"][info.index]
+    a, b = ref[0], ref[1]
+    for lo, hi in ((0, 2), (1, 3)):
+        gap = ((a[lo] - b[lo]) + (a[hi] - b[hi])) / 2          # 左右页的位置差（两条边取平均，不改变大小）
+        # 页序的奇偶不可靠（前置部分多一页少一页就反了），所以不押注谁是左页谁是右页：
+        # 「同一侧」「差一个位置差」「反方向差一个位置差」三种都试，取和本页检测到的边最吻合的
+        best = None
+        for move in (0.0, gap, -gap):
+            d_lo, d_hi = auto[lo] - (target[lo] + move), auto[hi] - (target[hi] + move)
+            snap = d_lo if abs(d_lo) <= abs(d_hi) else d_hi
+            if best is None or abs(snap) < abs(best[1]) - 1e-9:
+                best = (move, snap)
+        move, snap = best
+        same_size = abs((target[hi] - target[lo]) - (auto[hi] - auto[lo])) <= FULL_PAGE_TOLERANCE
+        if same_size:
+            # 本页检测到的红框和邻页的一样大：那它的位置是可信的，直接对准（两条边的差取平均）。
+            # 扫描位置的上下抖动可以有好几个百分点，这时不能拿 3% 的贴边容差去卡它
+            move = ((auto[lo] - target[lo]) + (auto[hi] - target[hi])) / 2
+        elif abs(snap) <= EDGE_MATCH_TOLERANCE:
+            move += snap
+        target[lo] += move
+        target[hi] += move
+    return tuple(round(float(t - a), 5) for t, a in zip(target, auto))
 
 
 def content_box(info, ref):
@@ -559,7 +622,33 @@ def compute_shift(info, ref, per_page):
 
 # ---------------------------------------------------------------- 输出
 
-def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None):
+def remove_margin_stains(img, rect, bilevel):
+    """把 rect (x0, y0, x1, y1，像素) 以外疑似墨迹的地方，按周围干净纸面的颜色重新画上。就地修改 img。
+
+    黑白二值页的纸面就是白色，框外直接涂白。灰度/彩色页先估计「没有墨迹的纸面长什么样」：
+    做一次大核的闭运算（先膨胀后腐蚀），比核小的深色东西——污点、黑边、阴影——都会被周围的
+    纸色填平；再和原图比，明显比纸面深的像素就是疑似墨迹，换成那里的纸色。这样填上去的是
+    **当地的**纸色（扫描件的纸面往往一边亮一边暗），不是全页统一的一个颜色，也不动干净的地方。
+    """
+    h, w = img.shape[:2]
+    x0, y0, x1, y1 = rect
+    outside = np.ones((h, w), dtype=bool)
+    outside[y0:y1, x0:x1] = False
+    if bilevel:
+        img[outside] = 255
+        return img
+    f = 4                                               # 纸面的明暗变化很平缓，缩小 4 倍算，快 16 倍
+    small = cv2.resize(img, (max(w // f, 1), max(h // f, 1)), interpolation=cv2.INTER_AREA)
+    k = max(int(0.06 * min(small.shape[:2])) | 1, 9)    # 能填平宽度在页面 6% 以内的黑边
+    paper = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    paper = cv2.resize(cv2.GaussianBlur(paper, (k, k), 0), (w, h), interpolation=cv2.INTER_LINEAR)
+    stain = (to_gray(paper).astype(np.int16) - to_gray(img).astype(np.int16)) > 24
+    stain = cv2.dilate((stain & outside).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & outside
+    img[stain] = paper[stain]
+    return img
+
+
+def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, cleanup=None):
     """对整页图像做「旋转 + 平移」。scale > 1 时同时放大输出（见 Options.upscale）。
 
     不需要旋转的页只做整像素平移、不插值，像素原样搬运，完全无损。
@@ -597,6 +686,11 @@ def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None):
         mask = np.ones((h, w), dtype=bool)
         mask[y0:y1, x0:x1] = False
         out[mask] = bg if img.ndim == 3 else bg[0]
+    if cleanup:                                 # cleanup 是这一页的红框（cleanup_box），去掉它外面的污染
+        pad = 0.004
+        rect = (max(int((cleanup[0] + shift[0] - pad) * w), 0), max(int((cleanup[1] + shift[1] - pad) * h), 0),
+                min(int((cleanup[2] + shift[0] + pad) * w), w), min(int((cleanup[3] + shift[1] + pad) * h), h))
+        out = remove_margin_stains(out, rect, info.bilevel)
     return out
 
 
@@ -850,11 +944,13 @@ def plan_page(info, ref, opts, skip=False):
     if info.bbox and opts.center:
         shift = compute_shift(info, ref, opts.per_page)
     trivial = angle == 0.0 and max(abs(shift[0]), abs(shift[1])) < 0.003
-    untouched = info.mode == "copy" or (trivial and not opts.clean_margin)
+    cleanup = cleanup_box(info, ref) is not None
+    untouched = info.mode == "copy" or (trivial and not opts.clean_margin and not cleanup)
     if untouched:
         status = info.note or "无需修正"
     else:
         status = (f"旋转 {angle:+.2f}°  平移 x{shift[0] * 100:+.1f}% y{shift[1] * 100:+.1f}%"
+                  + ("  去除边缘污染" if cleanup else "")
                   + (f"  ({info.note})" if info.note else ""))
     return angle, shift, untouched, status
 
@@ -890,7 +986,7 @@ def process_document(doc, infos, opts, output, progress=None, log=None, cancelle
             img = load_page_image(doc, page, info, opts.dpi)
             img = transform_image(img, info, angle, shift, opts.clean_margin,
                                   scale=2 if opts.upscale and info.bilevel else 1,
-                                  bbox=content_box(info, ref))
+                                  bbox=content_box(info, ref), cleanup=cleanup_box(info, ref))
             new_page = out.new_page(width=page.rect.width, height=page.rect.height)
             new_page.insert_image(new_page.rect, keep_proportion=False,
                                   stream=encode_image(img, info.bilevel, opts.quality))
@@ -963,11 +1059,12 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
             info, angle, shift, src = group[j]
             scale = 2 if opts.upscale and info.bilevel else 1
             key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4),
-                   opts.clean_margin, scale, None if info.bilevel else opts.quality, opts.dpi)
+                   opts.clean_margin, scale, None if info.bilevel else opts.quality, opts.dpi,
+                   cleanup_box(info, ref))
             if key not in cache:
                 img = load_page_image(doc, doc[info.index], info, opts.dpi)
                 img = transform_image(img, info, angle, shift, opts.clean_margin, scale=scale,
-                                      bbox=content_box(info, ref))
+                                      bbox=content_box(info, ref), cleanup=cleanup_box(info, ref))
                 cache[key] = encode_image(img, info.bilevel, opts.quality)
             rect = doc[info.index].rect
             tmp.new_page(width=rect.width, height=rect.height).insert_image(
@@ -1013,7 +1110,7 @@ def preview_page(doc, info, ref, opts, skip=False):
     before = load_page_image(doc, page, render_info, 100 if info.mode == "copy" else opts.dpi)
     after = before if untouched else transform_image(
         before, info, angle, shift, opts.clean_margin, scale=2 if opts.upscale and info.bilevel else 1,
-        bbox=content_box(info, ref))
+        bbox=content_box(info, ref), cleanup=cleanup_box(info, ref))
     if info.bilevel and not untouched:      # 预览也按实际输出那样二值化，所见即所得
         after = cv2.threshold(to_gray(after), 127, 255, cv2.THRESH_BINARY)[1]
     box = None
@@ -1044,6 +1141,7 @@ def main():
     ap.add_argument("--pages", help="只处理指定页，如 1-20 或 3,5,8-12（页码从 1 开始）")
     ap.add_argument("--skip-pages", help="这些页不做修正、原样保留，写法同 --pages")
     ap.add_argument("--delete-pages", help="这些页不输出到新 PDF，写法同 --pages")
+    ap.add_argument("--cleanup-pages", help="这些页去除版心以外的边缘污染，写法同 --pages")
     ap.add_argument("--max-angle", type=float, default=5.0, help="倾斜检测范围 ±度 (默认 5)")
     ap.add_argument("--min-angle", type=float, default=None,
                     help="小于此角度不旋转 (默认: 分析全书后自动采用建议值)")
@@ -1081,9 +1179,12 @@ def main():
         print(f"未指定 --quality，采用 {opts.quality}")
     skip_pages = set(parse_pages(args.skip_pages, doc.page_count)) if args.skip_pages else set()
     delete_pages = set(parse_pages(args.delete_pages, doc.page_count)) if args.delete_pages else set()
-    estimate = estimate_output_size(doc, infos, compute_reference(infos), opts, skip_pages, delete_pages)[0]
+    ref = compute_reference(infos)
+    if ref and args.cleanup_pages:
+        ref["cleanup"] = set(parse_pages(args.cleanup_pages, doc.page_count))
+    estimate = estimate_output_size(doc, infos, ref, opts, skip_pages, delete_pages)[0]
     print(f"预计输出约 {format_size(estimate)}（原文件 {format_size(args.input.stat().st_size)}）")
-    changed = process_document(doc, infos, opts, output, log=print, copy_toc=not args.pages,
+    changed = process_document(doc, infos, opts, output, log=print, copy_toc=not args.pages, ref=ref,
                                skip_pages=skip_pages, delete_pages=delete_pages)
     deleted = sum(1 for p in infos if p.index in delete_pages)
     print(f"\n完成：共 {len(infos)} 页，修正 {changed} 页"

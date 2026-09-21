@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS pages (
     page_index  INTEGER NOT NULL,            -- 从 0 开始
     skip        INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「本页不修正」
     deleted     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「删除当前页」（新 PDF 中不输出）
+    cleanup     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「去除边缘污染」
+    box_adjust  TEXT,                        -- 用户对版心四条边的手动微调 [左, 上, 右, 下]（JSON），没调过为 NULL
     analysis    TEXT,                        -- 这一页的分析结果（PageInfo 的 JSON）
     PRIMARY KEY (book_id, page_index)
 );
@@ -95,6 +97,10 @@ class Store:
         cols = {r["name"] for r in self.db.execute("PRAGMA table_info(pages)")}
         if "deleted" not in cols:
             self.db.execute("ALTER TABLE pages ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+        if "cleanup" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN cleanup INTEGER NOT NULL DEFAULT 0")
+        if "box_adjust" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN box_adjust TEXT")
 
     def close(self):
         self.db.close()
@@ -138,13 +144,32 @@ class Store:
         self.db.execute("DELETE FROM books WHERE id = ?", (book_id,))
         self.db.commit()
 
+    def prune_missing(self):
+        """删掉原文件已经不存在的书的记录（连同它的逐页设定）。返回被删掉的那些文件的路径。
+
+        只有「所在的盘还在、文件却没了」才算不存在。盘符（或网络路径的根）本身就访问不到——
+        移动硬盘没插、网络盘没连上、同步盘没挂载——只是暂时够不着，不能因此把校正进度全删了。
+        """
+        removed = []
+        for book in self.db.execute("SELECT id, path FROM books").fetchall():
+            path = Path(book["path"])
+            try:
+                gone = not path.exists() and bool(path.anchor) and Path(path.anchor).exists()
+            except OSError:                 # 路径本身有问题（权限、格式），拿不准就不删
+                gone = False
+            if gone:
+                self.db.execute("DELETE FROM books WHERE id = ?", (book["id"],))
+                removed.append(book["path"])
+        self.db.commit()
+        return removed
+
     @staticmethod
     def options_of(book):
         return json.loads(book["options"]) if book["options"] else {}
 
     # ------------------------------------------------------------ 页
 
-    PAGE_FLAGS = ("skip", "deleted")    # pages 表里用户逐页设置的开关
+    PAGE_FLAGS = ("skip", "deleted", "cleanup")    # pages 表里用户逐页设置的开关
 
     def set_page_flag(self, book_id, page_index, flag, value):
         assert flag in self.PAGE_FLAGS
@@ -159,6 +184,21 @@ class Store:
         assert flag in self.PAGE_FLAGS
         rows = self.db.execute(f"SELECT page_index FROM pages WHERE book_id = ? AND {flag} = 1", (book_id,))
         return {r["page_index"] for r in rows}
+
+    def set_box_adjust(self, book_id, page_index, offsets):
+        """保存某一页版心的手动微调；offsets 为 None 或全 0 表示复位。"""
+        value = json.dumps([round(o, 5) for o in offsets]) if offsets and any(offsets) else None
+        self.db.execute("""
+            INSERT INTO pages (book_id, page_index, box_adjust) VALUES (?, ?, ?)
+            ON CONFLICT (book_id, page_index) DO UPDATE SET box_adjust = excluded.box_adjust""",
+                        (book_id, page_index, value))
+        self.db.execute("UPDATE books SET updated_at = ? WHERE id = ?", (_now(), book_id))
+        self.db.commit()
+
+    def box_adjusts(self, book_id):
+        rows = self.db.execute(
+            "SELECT page_index, box_adjust FROM pages WHERE book_id = ? AND box_adjust IS NOT NULL", (book_id,))
+        return {r["page_index"]: tuple(json.loads(r["box_adjust"])) for r in rows}
 
     def save_analysis(self, book_id, infos, params):
         """保存全书的分析结果。用户的手动调整（skip）原样保留。"""

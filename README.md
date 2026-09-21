@@ -7,7 +7,7 @@
 - 自动排除扫描黑边、空白处的污渍、挂在正文外侧的页码对版心判断的干扰
 - 尽量不损失画质：直接取用 PDF 内嵌的原图；不需要旋转的页只做整像素平移（JPEG 按编码块对齐）
 - 分析后给出参数建议（不旋转角度、JPEG 质量等），并预估输出文件的大小
-- 逐页可以指定「本页不修正」或「删除当前页」
+- 逐页可以指定「本页不修正」「删除当前页」「去除边缘污染」，可以手动微调版心边框，或让它「与前页/后页相同」
 - 校正进度保存在 SQLite 数据库里，下次打开同一本书直接恢复（按文件内容识别，改名、挪位置也认得）
 
 不做书脊弯曲（dewarp）之类的复杂修正。
@@ -41,7 +41,7 @@ python pdf_reshape_gui.py [书.pdf]
 
 ```
 python pdf_reshape.py 书.pdf [-o 输出.pdf] [--pages 1-20] [--skip-pages 3,8] [--delete-pages 1,2]
-                             [--clean-margin] [--upscale] [--min-angle 0.3] [--quality 70]
+                             [--cleanup-pages 4,7] [--clean-margin] [--upscale] [--min-angle 0.3] [--quality 70]
 ```
 
 | 选项 | 作用 |
@@ -49,6 +49,7 @@ python pdf_reshape.py 书.pdf [-o 输出.pdf] [--pages 1-20] [--skip-pages 3,8] 
 | `--pages` | 只处理指定的页（试效果用） |
 | `--skip-pages` | 这些页不做修正，原样保留 |
 | `--delete-pages` | 这些页不输出到新 PDF |
+| `--cleanup-pages` | 这些页去除版心以外的边缘污染（按周围干净的纸面重新画上） |
 | `--clean-margin` | 把版心以外涂成纸色（去黑边、阴影） |
 | `--upscale` | 黑白二值页旋转时以 2 倍分辨率输出，笔画边缘更平滑 |
 | `--min-angle` | 小于此角度不旋转（不指定则自动采用建议值） |
@@ -61,10 +62,10 @@ python pdf_reshape.py 书.pdf [-o 输出.pdf] [--pages 1-20] [--skip-pages 3,8] 
 
 ## 开发
 
-设计上的取舍和踩过的坑记在 [CLAUDE.md](CLAUDE.md) 里。回归测试：
+设计上的取舍和踩过的坑记在 [CLAUDE.md](CLAUDE.md) 里。回归测试（不依赖 pytest，详见 [tests/README.md](tests/README.md)）：
 
 ```
-python tests/make_test.py h.pdf v.pdf
-python pdf_reshape.py h.pdf -o h_out.pdf
-python tests/verify.py h_out.pdf
+python tests/run_all.py             # 全部，约 2 分钟；界面测试会弹出窗口自己操作
+python tests/run_all.py --no-gui    # 只跑核心测试，约 1 分钟
+python tests/check_book.py 书.pdf   # 用真实的扫描书核对版心检测和对齐规则
 ```

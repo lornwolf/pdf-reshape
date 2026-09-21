@@ -20,6 +20,8 @@ import pdf_reshape as core
 from pdf_reshape_store import Store
 
 PREVIEW_MAX_SIDE = 1600   # 预览用图像的长边上限（像素）
+NUDGE_STEP = 0.002        # 版心边框每按一次移动页面宽（高）的 0.2%
+EDGES = {"上": 1, "下": 3, "左": 0, "右": 2}       # 边 → 版心 (左, 上, 右, 下) 里的下标
 
 
 class App(tk.Tk):
@@ -45,6 +47,8 @@ class App(tk.Tk):
         self.book = None                   # 数据库里这本书的记录
         self.skipped = set()               # 用户指定「本页不修正」的页（从 0 开始）
         self.deleted = set()               # 用户指定「删除当前页」的页：新 PDF 中不输出
+        self.adjust = {}                   # 用户对版心边框的手动微调 {页序: (左, 上, 右, 下 的移动量)}
+        self.cleanup = set()               # 用户指定「去除边缘污染」的页
         self.estimate_gen = 0              # 输出大小预估的请求序号（丢弃过期结果用）
         self.estimate_key = None           # 上次预估时的全部相关设置；没变就不重算
         self.estimate_cache = {}           # 抽样页的编码结果，多次预估之间复用
@@ -58,6 +62,12 @@ class App(tk.Tk):
 
         self._build_ui()
         self.after(50, self._poll)
+        if self.store:                      # 启动时清理历史记录：原文件已经不在了的书，记录一并删掉
+            try:
+                for path in self.store.prune_missing():
+                    self.write_log(f"原文件已不存在，删除了它的历史记录：{path}")
+            except Exception as e:
+                self.write_log(f"清理历史记录时出错（不影响使用）：{e}")
         if initial_file:
             self.open_file(initial_file)
 
@@ -175,6 +185,38 @@ class App(tk.Tk):
         self.lbl_skipped.pack(side="left", padx=4)
         self.lbl_page_status = ttk.Label(nav, text="", foreground="#0a58ca")
         self.lbl_page_status.pack(side="left", padx=8)
+
+        # ---- 第二行：手动微调当前页的版心边框（预览里的红框）
+        edge_bar = ttk.Frame(right)
+        edge_bar.pack(fill="x", pady=(4, 0))
+        ttk.Label(edge_bar, text="版心边框").pack(side="left")
+        self.var_edge = tk.StringVar(value="上")
+        edge_box = ttk.Combobox(edge_bar, textvariable=self.var_edge, values=list(EDGES), width=4, state="readonly")
+        edge_box.pack(side="left", padx=(6, 10))
+        edge_box.bind("<<ComboboxSelected>>", lambda e: self.update_nudge_buttons())
+        self.nudge_buttons = {}
+        # 按钮上画三角形：↑↓ 这两个字符会被 Windows 固定换成彩色的表情符号，和 ←→ 不一致
+        glyphs = {"↑": "▲", "↓": "▼", "←": "◀", "→": "▶"}
+        for arrow, delta in (("↑", -1), ("↓", 1), ("←", -1), ("→", 1)):
+            # tk.Button 而不是 ttk：按住不放可以连续调（repeatdelay / repeatinterval）
+            btn = tk.Button(edge_bar, text=glyphs[arrow], width=3, relief="groove", state="disabled",
+                            repeatdelay=400, repeatinterval=80, command=lambda d=delta: self.nudge(d))
+            btn.pack(side="left", padx=1)
+            self.nudge_buttons[arrow] = btn
+        self.btn_nudge_reset = ttk.Button(edge_bar, text="复位", width=5, command=self.reset_nudge, state="disabled")
+        self.btn_nudge_reset.pack(side="left", padx=(10, 6))
+        # 红框照邻页的来：当前页的红框判断得不好、邻页的好时用。结果记成手动微调，可以再调、可以复位
+        self.btn_like_prev = ttk.Button(edge_bar, text="与前页相同", state="disabled",
+                                        command=lambda: self.copy_neighbor_box(-1))
+        self.btn_like_prev.pack(side="left", padx=(6, 2))
+        self.btn_like_next = ttk.Button(edge_bar, text="与后页相同", state="disabled",
+                                        command=lambda: self.copy_neighbor_box(1))
+        self.btn_like_next.pack(side="left", padx=2)
+        # 去除边缘污染：把红框外疑似墨迹的地方按周围干净的纸面重新画上。逐页的开关
+        self.btn_cleanup = ttk.Button(edge_bar, text="去除边缘污染", state="disabled", command=self.toggle_cleanup)
+        self.btn_cleanup.pack(side="left", padx=(12, 6))
+        self.lbl_nudge = ttk.Label(edge_bar, text="", foreground="#666")
+        self.lbl_nudge.pack(side="left", padx=4)
 
         panes = ttk.Frame(right)
         panes.pack(fill="both", expand=True, pady=4)
@@ -333,10 +375,12 @@ class App(tk.Tk):
         self.var_page.set(min(max(book["current_page"] or 1, 1), self.page_count))
         self.skipped = self.store.flagged_pages(book["id"], "skip")
         self.deleted = self.store.flagged_pages(book["id"], "deleted")
+        self.adjust = self.store.box_adjusts(book["id"])
+        self.cleanup = self.store.flagged_pages(book["id"], "cleanup")
 
     def update_skip_label(self):
         parts = []
-        for title, marked in (("不修正", self.skipped), ("删除", self.deleted)):
+        for title, marked in (("不修正", self.skipped), ("删除", self.deleted), ("去污", self.cleanup)):
             if marked:
                 pages = sorted(i + 1 for i in marked)
                 shown = ", ".join(map(str, pages[:6])) + (" …" if len(pages) > 6 else "")
@@ -346,6 +390,93 @@ class App(tk.Tk):
     def update_skip_button(self, skip):
         self.var_skip.set(skip)
         self.btn_skip.configure(text="恢复本页修正" if skip else "本页不修正")
+
+    # ------------------------------------------------------------ 手动微调版心边框
+
+    def current_index(self):
+        try:
+            return min(max(self.var_page.get(), 1), self.page_count) - 1
+        except tk.TclError:
+            return 0
+
+    def attach_adjust(self):
+        """把逐页的手动设定挂到标准版心的统计结果上；core 的 page_box / cleanup_box 会自动用上。"""
+        if self.ref is not None:
+            self.ref["adjust"] = self.adjust
+            self.ref["cleanup"] = self.cleanup
+
+    def neighbor_index(self, direction):
+        """前（-1）/后（+1）方向上最近的一个有版心、没被删除的页；没有就返回 None。"""
+        i = self.current_index() + direction
+        while self.infos and 0 <= i < len(self.infos):
+            if self.infos[i].bbox and i not in self.deleted:
+                return i
+            i += direction
+        return None
+
+    def copy_neighbor_box(self, direction):
+        index, other = self.current_index(), self.neighbor_index(direction)
+        if self.ref is None or other is None or not self.infos[index].bbox:
+            return
+        self.set_adjust(index, core.box_like_neighbor(self.infos[index], self.infos[other], self.ref))
+
+    def toggle_cleanup(self):
+        if not self.page_count:
+            return
+        index = self.current_index()
+        on = index not in self.cleanup
+        (self.cleanup.add if on else self.cleanup.discard)(index)
+        if self.store and self.book:
+            self.store.set_page_flag(self.book["id"], index, "cleanup", on)
+        self.update_skip_label()
+        self.update_nudge_buttons()
+        self.request_preview()
+
+    def update_nudge_buttons(self):
+        """选「上/下」时只有上下箭头可用，选「左/右」时只有左右箭头可用；全书分析完之前都不可用。"""
+        ready = self.ref is not None and self.analysis_key == self.current_key(self.get_options())
+        vertical_edge = self.var_edge.get() in ("上", "下")
+        for arrow, btn in self.nudge_buttons.items():
+            usable = ready and (arrow in "↑↓") == vertical_edge
+            btn.configure(state="normal" if usable else "disabled")
+        index = self.current_index()
+        has_box = ready and bool(self.infos) and index < len(self.infos) and bool(self.infos[index].bbox)
+        self.btn_like_prev.configure(
+            state="normal" if has_box and self.neighbor_index(-1) is not None else "disabled")
+        self.btn_like_next.configure(
+            state="normal" if has_box and self.neighbor_index(1) is not None else "disabled")
+        self.btn_cleanup.configure(state="normal" if has_box else "disabled",
+                                   text="取消去除污染" if index in self.cleanup else "去除边缘污染")
+        offsets = self.adjust.get(index)
+        self.btn_nudge_reset.configure(state="normal" if ready and offsets else "disabled")
+        if offsets:
+            parts = [f"{name}{offsets[i] * 100:+.1f}%" for name, i in EDGES.items() if abs(offsets[i]) > 1e-9]
+            self.lbl_nudge.configure(text="本页已微调: " + "  ".join(parts))
+        else:
+            self.lbl_nudge.configure(text="")
+
+    def nudge(self, direction):
+        """把选中的那条边移动一步。direction: -1 向上/向左，+1 向下/向右。"""
+        if self.ref is None or not self.page_count:
+            return
+        index = self.current_index()
+        offsets = list(self.adjust.get(index, (0.0, 0.0, 0.0, 0.0)))
+        offsets[EDGES[self.var_edge.get()]] += direction * NUDGE_STEP
+        offsets = tuple(0.0 if abs(o) < 1e-9 else round(o, 5) for o in offsets)
+        self.set_adjust(index, offsets)
+
+    def reset_nudge(self):
+        self.set_adjust(self.current_index(), None)
+
+    def set_adjust(self, index, offsets):
+        if offsets and any(offsets):
+            self.adjust[index] = offsets
+        else:
+            self.adjust.pop(index, None)
+        if self.store and self.book:
+            self.store.set_box_adjust(self.book["id"], index, offsets)
+        self.update_nudge_buttons()
+        self.schedule_preview()              # 重新计算这一页的对齐并刷新显示（连按时合并成一次）
 
     def update_delete_button(self, deleted):
         self.btn_delete.configure(text="恢复当前页" if deleted else "删除当前页",
@@ -451,7 +582,8 @@ class App(tk.Tk):
         except ValueError:
             return
         key = (self.analysis_key, opts.deskew, opts.center, opts.per_page, opts.clean_margin, opts.upscale,
-               opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices))
+               opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices),
+               tuple(sorted(self.adjust.items())), frozenset(self.cleanup))
         if key == self.estimate_key or not indices:
             return
         self.estimate_key = key
@@ -530,6 +662,8 @@ class App(tk.Tk):
         self.var_pages.set("")
         self.skipped = set()
         self.deleted = set()
+        self.adjust = {}
+        self.cleanup = set()
         self.btn_delete.configure(state="normal")
         self.lbl_total.configure(text=f"/ {self.page_count}")
         self.btn_run.configure(state="normal")
@@ -544,12 +678,14 @@ class App(tk.Tk):
                 opts = self.get_options()
                 infos = self.store.load_analysis(self.book, (opts.max_angle, opts.dpi))
                 self.write_log(f"已恢复上次的进度（{self.book['updated_at'].replace('T', ' ')}）：选项、"
-                               f"第 {self.var_page.get()} 页、不修正 {len(self.skipped)} 页、删除 {len(self.deleted)} 页"
+                               f"第 {self.var_page.get()} 页、不修正 {len(self.skipped)} 页、删除 {len(self.deleted)} 页、"
+                               f"微调版心 {len(self.adjust)} 页"
                                + ("、全书分析结果。" if infos else "。分析结果需要重新生成。"))
         self.update_skip_label()
         self.btn_reanalyze.pack_forget()
         if infos:
             self.infos, self.ref = infos, core.compute_reference(infos)
+            self.attach_adjust()
             self.analysis_key = self.current_key(self.get_options())
             self.btn_reanalyze.pack(fill="x", pady=(6, 0), before=self.btn_run)
             self.progress.configure(value=100)
@@ -672,7 +808,7 @@ class App(tk.Tk):
     def on_page_key(self, event, delta):
         # 焦点在输入框里时，方向键和 Home/End 是用来改数值、移动光标的，不能拿来翻页；
         # PageUp/PageDown 在输入框里没有别的用途，始终翻页
-        typing = event.widget.winfo_class() in ("TSpinbox", "TEntry", "Entry", "Text")
+        typing = event.widget.winfo_class() in ("TSpinbox", "TEntry", "Entry", "Text", "TCombobox")
         if typing and event.keysym not in ("Prior", "Next"):
             return
         self.step_page(delta)
@@ -709,6 +845,7 @@ class App(tk.Tk):
         deleted = index in self.deleted
         self.update_skip_button(skip)
         self.update_delete_button(deleted)
+        self.update_nudge_buttons()
         self.update_recommend_label()
         self.save_state()                   # 翻页、改选项都会走到这里
         self.schedule_estimate()
@@ -804,6 +941,7 @@ class App(tk.Tk):
             if self.store and self.book:
                 self.store.save_analysis(self.book["id"], infos, key[1:])
             self.ref = core.compute_reference(infos)
+            self.attach_adjust()
             scans = sum(1 for p in infos if p.bbox)
             self.write_log(f"分析完成：{len(infos)} 页中有 {scans} 页可修正。")
             self.show_recommendation()
