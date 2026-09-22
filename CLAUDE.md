@@ -54,6 +54,7 @@ python tests/check_book.py 书.pdf --pages 9,27     # 用真实的书核对（�
 页面只有一张正放的图时（`classify_page` → `native`），用 `fitz.Pixmap(doc, xref)` 取原图，不用 `get_pixmap` 渲染，否则 1bit 图会被放大成灰度 JPEG，又糊又大。
 扫描图**不一定占满页面**：`place_on_page` 按它在页面中的位置贴到整页画布上（保持原图分辨率），并记下 `scan_rect`。只要覆盖页面 50% 以上就走 native。
 没有图像的页、空白页、内容占满整页的页、无需修正的页，用 `insert_pdf` 原样复制。
+**彩色封面**（`is_full_bleed_color`，`PageInfo.full_bleed_color`）：整页图片本来靠「深色内容占满 95%」来认，封面上浅色的渐变底不算深色内容，封面因此被当成普通页——标题加插画那一块成了版心、拿去和文字页对齐，出血的封面被平移 5%，一边露出一条平色带。所以分析时另记一个标记：带颜色（彩度 >20 的像素占 5% 以上）且四周 3% 的边缘带里够亮的像素不到一半。**只在文字书里生效**（`plan_page` 按 `opts.book` 判断，分析结果与类型无关、换类型不用重新分析）：漫画整页都是画面，出血的彩页也要照常纠偏、对齐。带白边的彩色封面照常处理，需要的话手动「本页不修正」。指定了去污的封面和「本页不修正」一样：位置不动、只去污。
 **图像蒙版（ImageMask）**：有的扫描软件把黑白页存成没有色彩空间的 1bit 蒙版，`fitz.Pixmap(doc, xref)` 得到 `colorspace is None`，对它做色彩空间转换会报 `source colorspace must not be None`（用户遇到过）。蒙版只记录哪些点上色，颜色和 0/1 的含义由页面决定，不能直接当灰度图用；`load_native_image` 对这种图改为**按图自身的分辨率渲染它所在的区域**（像素一一对应），再二值化去掉抗锯齿。测试文件用 scratchpad 里的做法生成：插入 1bit PNG 后 `xref_set_key(x, "ImageMask", "true")` 并把 `ColorSpace` 设为 `null`。
 **单页出错不能让整本书失败**：`analyze_document` 里某一页抛异常，就把它记成 `copy`（原样保留）并在 `note` 里写明原因，其余页照常。真实的扫描 PDF 千奇百怪，总会有没见过的结构。
 

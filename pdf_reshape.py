@@ -25,7 +25,7 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-ANALYSIS_VERSION = 5        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
+ANALYSIS_VERSION = 6        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
 ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
 FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
 HANGING_TOLERANCE = 0.03    # 全部内容比标准的正文宽出这么多，才认为有东西（页码、页眉）挂在正文外面
@@ -34,6 +34,8 @@ EDGE_MATCH_TOLERANCE = 0.03  # 半页的版心边缘与同类页相差在此以�
 FLUSH_RATIO = 0.35          # 略窄的页：一边离标准版心的距离不到另一边的这个比例，就认为这一边是对齐的、缩进全在另一边
 NARROW_TOLERANCE = 0.12     # 版心只比标准版心小这么多以内时，可以放心地单独居中（误差不超过它的一半）
 FULL_BLEED_RATIO = 0.95     # 内容占满页面超过这个比例时，视为整页图片，不处理
+COLOR_CHROMA = 20           # 页面里彩度（RGB 三通道的最大差）超过这个值的像素占 5% 以上，才算彩色页
+PAPER_LIKE = 200            # 页边一圈里亮度至少这么高的像素才算纸；见 is_full_bleed_color
 
 
 @dataclass
@@ -51,6 +53,7 @@ class PageInfo:
     dense_bbox: tuple | None = None  # 按墨迹密度求出的正文范围 (x0, y0, x1, y1)；见 dense_extent
     enhance: str = ""           # 「显示增强」对这一页适合用的方法，空 = 增强了也没有明显改善；见 assess_enhancement
     shade: float = 0.0          # 灰度/彩色页：页边的纸色比中部暗多少级（订口阴影）；见 measure_shade
+    full_bleed_color: bool = False  # 彩色、画面一直铺到页边的页（封面等）：文字书里原样保留；见 is_full_bleed_color
     scan_rect: tuple = (0.0, 0.0, 1.0, 1.0)  # 扫描图在页面中的范围（归一化）
     # 以下两项每次 load_page_image 时重新填写，不依赖保存下来的分析结果
     jpeg_block: int = 0         # 原图是 JPEG 时，它的编码块大小（灰度 8、彩色 16）；不是 JPEG 为 0
@@ -397,7 +400,34 @@ def dense_extent(ink):
     return float(lo / w), float(hi / w)
 
 
+def is_full_bleed_color(img, scan_rect=(0.0, 0.0, 1.0, 1.0)):
+    """彩色、而且画面一直铺到页边的页（彩色封面、整页彩图）。
+
+    整页图片本来靠「深色内容占满页面 95%」来认，可封面上浅色的渐变底不算深色内容，于是封面被当成
+    普通页：标题和插画那一块成了「版心」，拿去和文字页对齐，整页出血的封面被平移了 5%，一边露出
+    一条平色带。所以另加一条：页面带颜色（彩度明显的像素占 5% 以上），并且四周 3% 的边缘带里
+    像纸的（够亮的）像素不到一半——画面铺到了边上。黑白扫描边不会误判：它是黑的、不带颜色。
+    带白边的彩色封面不算，它照常处理，需要的话手动「本页不修正」。只看扫描图的范围。
+    """
+    if img.ndim != 3:
+        return False
+    h, w = img.shape[:2]
+    x0, y0 = int(scan_rect[0] * w), int(scan_rect[1] * h)
+    area = img[y0:int(scan_rect[3] * h):4, x0:int(scan_rect[2] * w):4]
+    if min(area.shape[:2]) < 20:
+        return False
+    chroma = area.max(axis=2).astype(np.int16) - area.min(axis=2).astype(np.int16)
+    if (chroma > COLOR_CHROMA).mean() < 0.05:
+        return False
+    ah, aw = area.shape[:2]
+    bx, by = max(int(0.03 * aw), 1), max(int(0.03 * ah), 1)
+    lum = to_gray(area)
+    bands = np.concatenate([lum[:, :bx].ravel(), lum[:, -bx:].ravel(), lum[:by, :].ravel(), lum[-by:, :].ravel()])
+    return bool((bands >= PAPER_LIKE).mean() < 0.5)
+
+
 def analyze(img, info, max_angle):
+    info.full_bleed_color = is_full_bleed_color(img, info.scan_rect)
     gray = to_gray(img)
     scale = ANALYSIS_LONG_SIDE / max(gray.shape)
     small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) \
@@ -1335,6 +1365,12 @@ def plan_page(info, ref, opts, skip=False):
         if cleanup_box(info, ref) is not None:
             return 0.0, (0.0, 0.0), False, "本页不修正（手动指定）  去除边缘污染"
         return 0.0, (0.0, 0.0), True, "本页不修正（手动指定）"
+    if info.full_bleed_color and opts.book == "text":
+        # 文字书里的彩色封面、整页彩图：原样保留（漫画整页都是画面，出血的彩页也照常纠偏、对齐）。
+        # 和「本页不修正」一样，用户逐页指定的去污照做
+        if cleanup_box(info, ref) is not None:
+            return 0.0, (0.0, 0.0), False, "彩色整页图片，位置不动  去除边缘污染"
+        return 0.0, (0.0, 0.0), True, "彩色整页图片，原样保留"
     angle = info.angle if opts.deskew and abs(info.angle) >= opts.min_angle else 0.0
     shift = (0.0, 0.0)
     if info.bbox and opts.center:

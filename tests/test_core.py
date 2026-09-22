@@ -336,6 +336,29 @@ def test_enhance_output():
 
 # ---------------------------------------------------------------- 建议值与大小预估
 
+def test_color_cover_is_left_alone_in_text_books():
+    """文字书里画面铺满整页的彩色封面原样保留；带白边的封面和漫画的彩页照常处理。"""
+    f = Failures()
+    doc, infos, opts = analyzed(fixtures()["cover.pdf"])
+    ref = pr.compute_reference(infos)
+    f.check(infos[0].full_bleed_color and not infos[1].full_bleed_color and not any(p.full_bleed_color for p in infos[2:]),
+            f"只有第 1 页是彩色整页图片，实际 {[p.full_bleed_color for p in infos]}")
+    text, manga = pr.Options(book="text"), pr.Options(book="manga")
+    f.check(pr.plan_page(infos[0], ref, text)[2] and "彩色整页图片" in pr.plan_page(infos[0], ref, text)[3], "文字书：封面应原样保留")
+    f.check(not pr.plan_page(infos[0], ref, manga)[2], "漫画书：出血的彩页照常处理")
+    f.check(not pr.plan_page(infos[1], ref, text)[2], "带白边的封面照常处理")
+    ref["cleanup"] = {0}
+    f.check(not pr.plan_page(infos[0], ref, text)[2] and pr.plan_page(infos[0], ref, text)[1] == (0.0, 0.0),
+            "指定了去污的封面：位置不动、只去污")
+    del ref["cleanup"]
+    out = work_path("core_cover_out.pdf")
+    pr.process_document(doc, infos, text, out, ref=ref)
+    src, got = page_array(fixtures()["cover.pdf"], 0), page_array(out, 0)
+    f.check(np.abs(src.astype(int) - got.astype(int)).mean() < 1, "原样保留的封面输出应和原来一样")
+    f.close(measure(out)[2]["angle"], 0, 0.11, "文字页照常纠偏")
+    return f
+
+
 def test_flatten_paper():
     """纸面找平：页边的灰影按当地纸色拉白，墨迹、排线相对纸面的深浅不变；实心黑块不动。"""
     f = Failures()

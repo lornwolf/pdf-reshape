@@ -13,6 +13,7 @@
               有的扫描软件这样存黑白页；对它做色彩空间转换会报 source colorspace must not be None
     wide.pdf  6 页。第 2、4 页的倾斜超出默认的 ±5° 检测范围；第 3、5 页由上下两张图拼成，
               取不了内嵌原图、只能渲染
+    cover.pdf 彩色封面 2 页（第 1 页画面铺满整页，第 2 页带白边）+ mask.pdf 的 8 页黑白文字页
     manga.pdf 漫画 6 页（灰度 JPEG）：分格、排线、实心黑块。第 1～4 页靠订口一侧有一道渐变的灰影
               （奇数页在右、偶数页在左，约 40 级），第 5、6 页纸面均匀
 """
@@ -151,8 +152,33 @@ def build_manga(path):
     _save([make_manga_page(rng, side, angle=0.6 if k == 2 else 0.0) for k, side in enumerate(sides)], path, 85)
 
 
+def make_cover(full):
+    """彩色封面：渐变的底色（浅，不算深色内容）、大标题、一块插画。full=False 时四周留白边。"""
+    yy, xx = np.mgrid[0:H, 0:W]
+    img = np.dstack([180 + 60 * xx / W, 120 + 100 * yy / H, np.full((H, W), 200)]).astype(np.uint8)
+    cv2.putText(img, "TITLE", (150, 500), cv2.FONT_HERSHEY_SIMPLEX, 6, (20, 20, 120), 25, cv2.LINE_AA)
+    cv2.circle(img, (620, 1100), 350, (30, 90, 30), -1)
+    if not full:
+        canvas = np.full((H, W, 3), 245, np.uint8)
+        canvas[130:-130, 90:-90] = cv2.resize(img, (W - 180, H - 260))
+        img = canvas
+    return img
+
+
+def build_cover(path):
+    doc = fitz.open()
+    for full in (True, False):
+        page = doc.new_page(width=595, height=842)
+        page.insert_image(page.rect, stream=_jpeg(make_cover(full), 85), keep_proportion=False)
+    mask = os.path.join(os.path.dirname(path), "mask.pdf")
+    if not os.path.exists(mask):
+        build_mask(mask)
+    doc.insert_pdf(fitz.open(mask))
+    doc.save(path)
+
+
 BUILDERS = {"h.pdf": build_horizontal, "v.pdf": build_vertical, "mask.pdf": build_mask, "wide.pdf": build_wide,
-            "manga.pdf": build_manga}
+            "manga.pdf": build_manga, "cover.pdf": build_cover}
 
 
 def build_all(directory):
