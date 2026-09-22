@@ -19,9 +19,9 @@ python tests/run_all.py --no-gui    # 只跑核心测试，约 1 分钟，不弹
 |---|---|
 | `run_all.py` | 一键运行：先核心、后界面 |
 | `test_core.py` | 核心处理和进度数据库的测试，不需要界面。`python tests/test_core.py [名字的一部分 ...]` 可以只跑几个 |
-| `test_gui.py` | 界面测试，14 个场景，每个场景一个子进程、带超时。`python tests/test_gui.py marks keys` 只跑几个；`--run 名字` 在当前进程里跑（调试用） |
+| `test_gui.py` | 界面测试，15 个场景，每个场景一个子进程、带超时。`python tests/test_gui.py marks keys` 只跑几个；`--run 名字` 在当前进程里跑（调试用） |
 | `gui_driver.py` | 驱动界面的工具：场景写成生成器，要等的时候 `yield` 一个条件 |
-| `make_test.py` | 生成合成的测试 PDF（每页的倾斜和偏移都是已知的）：横排、竖排、图像蒙版、大倾斜 + 需要渲染的页 |
+| `make_test.py` | 生成合成的测试 PDF（每页的倾斜和偏移都是已知的）：横排、竖排、图像蒙版、大倾斜 + 需要渲染的页、漫画（带订口灰影） |
 | `verify.py` | 测量一个 PDF 每页的残余倾斜和四边边距。`python tests/verify.py 输出.pdf` |
 | `check_book.py` | **用真实的扫描书核对**，见下 |
 | `harness.py` | 公共部分：工作目录、测试文件、极简的运行器 |

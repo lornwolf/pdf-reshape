@@ -13,6 +13,8 @@
               有的扫描软件这样存黑白页；对它做色彩空间转换会报 source colorspace must not be None
     wide.pdf  6 页。第 2、4 页的倾斜超出默认的 ±5° 检测范围；第 3、5 页由上下两张图拼成，
               取不了内嵌原图、只能渲染
+    manga.pdf 漫画 6 页（灰度 JPEG）：分格、排线、实心黑块。第 1～4 页靠订口一侧有一道渐变的灰影
+              （奇数页在右、偶数页在左，约 40 级），第 5、6 页纸面均匀
 """
 import os
 import random
@@ -112,7 +114,45 @@ def build_wide(path):
     doc.save(path)
 
 
-BUILDERS = {"h.pdf": build_horizontal, "v.pdf": build_vertical, "mask.pdf": build_mask, "wide.pdf": build_wide}
+MANGA_SHADE = 40            # manga.pdf 灰影最深处比中部暗的级数
+
+
+def make_manga_page(rng, shade_side, angle=0.0):
+    """漫画页：几格带边框的画面，格子里有排线（网点的替身）和一块实心黑；可选一侧的灰影。"""
+    img = np.full((H, W), PAPER, np.uint8)
+    frames = [(120, 150, 1120, 700), (120, 760, 600, 1400), (660, 760, 1120, 1400), (120, 1460, 1120, 1650)]
+    for k, (x0, y0, x1, y1) in enumerate(frames):
+        cv2.rectangle(img, (x0, y0), (x1, y1), INK, 4)
+        if k == 0:                                      # 排线：一根根 1 像素的斜线，密得像网点
+            for x in range(x0 + 20, x1 - 20, 4):
+                cv2.line(img, (x, y0 + 20), (x - 60, y1 - 20), INK, 1)
+        elif k == 1:
+            cv2.rectangle(img, (x0 + 40, y0 + 40), (x1 - 40, y1 - 40), INK, -1)     # 大块实心黑
+        else:
+            for _ in range(6):
+                cv2.putText(img, "".join(rng.choice("abcdefgh") for _ in range(4)),
+                            (x0 + 40, y0 + 80 + 90 * _), cv2.FONT_HERSHEY_SIMPLEX, 1.2, INK, 2, cv2.LINE_AA)
+    if shade_side:                                      # 靠订口一侧的灰影：从页边向内 12% 渐变到 0
+        width = int(0.12 * W)
+        ramp = (MANGA_SHADE * (1 - np.arange(width) / width)).astype(np.int16)
+        if shade_side == "left":
+            img[:, :width] = np.clip(img[:, :width].astype(np.int16) - ramp, 0, 255).astype(np.uint8)
+        else:
+            img[:, -width:] = np.clip(img[:, -width:].astype(np.int16) - ramp[::-1], 0, 255).astype(np.uint8)
+    if angle:
+        m = cv2.getRotationMatrix2D((W / 2, H / 2), angle, 1.0)
+        img = cv2.warpAffine(img, m, (W, H), borderValue=PAPER)
+    return img
+
+
+def build_manga(path):
+    rng = random.Random(3)
+    sides = ["right", "left", "right", "left", None, None]
+    _save([make_manga_page(rng, side, angle=0.6 if k == 2 else 0.0) for k, side in enumerate(sides)], path, 85)
+
+
+BUILDERS = {"h.pdf": build_horizontal, "v.pdf": build_vertical, "mask.pdf": build_mask, "wide.pdf": build_wide,
+            "manga.pdf": build_manga}
 
 
 def build_all(directory):

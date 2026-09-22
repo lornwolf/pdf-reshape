@@ -113,9 +113,13 @@ class Driver:
     def check(self, condition, message):
         return self.failures.check(condition, message)
 
-    def open(self, path):
+    def open(self, path, analyze=True):
+        """打开文件。打开后程序不会自动分析（用户要求），analyze=True 时替用户点一下「分析全书」——
+        有保存的分析结果的书直接恢复，不用点。"""
         self.app.open_file(path)
         self.app.update()
+        if analyze and self.app.infos is None and self.app.page_count:
+            self.click(self.app.btn_reanalyze)
 
     def goto(self, page):
         self.app.var_page.set(page)
@@ -145,7 +149,7 @@ class Driver:
         return self.app.log.get("1.0", "end").strip()
 
     def options(self):
-        names = ("deskew", "center", "per_page", "clean", "upscale", "enhance",
+        names = ("book", "deskew", "center", "per_page", "clean", "upscale", "enhance", "flatten",
                  "max_angle", "min_angle", "quality", "dpi")
         return {n: getattr(self.app, "var_" + n).get() for n in names}
 

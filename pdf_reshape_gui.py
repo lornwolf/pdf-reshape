@@ -127,6 +127,20 @@ class App(tk.Tk):
         side = ttk.Frame(body)
         side.pack(side="left", fill="y", padx=(0, 8))
 
+        # 书的类型：决定「修正内容」里显示哪些选项、分析完给哪些建议。存的是 core.BOOK_TYPES 的键
+        kind = ttk.Frame(side)
+        kind.pack(fill="x", pady=(0, 6))
+        ttk.Label(kind, text="书的类型").pack(side="left", padx=(6, 8))
+        self.var_book = tk.StringVar(value="text")
+        self.var_book_label = tk.StringVar(value=core.BOOK_TYPES["text"])
+        self.book_box = ttk.Combobox(kind, textvariable=self.var_book_label, values=list(core.BOOK_TYPES.values()),
+                                     width=8, state="readonly")
+        self.book_box.pack(side="left")
+        lock(self.book_box)
+        self.book_box.bind("<<ComboboxSelected>>", lambda e: self.var_book.set(
+            next(k for k, v in core.BOOK_TYPES.items() if v == self.var_book_label.get())))
+        self.var_book.trace_add("write", lambda *_: self.apply_book_type())
+
         box = ttk.LabelFrame(side, text="修正内容")
         box.pack(fill="x", pady=(0, 6))
         self.var_deskew = tk.BooleanVar(value=True)
@@ -135,14 +149,19 @@ class App(tk.Tk):
         self.var_clean = tk.BooleanVar(value=False)
         self.var_upscale = tk.BooleanVar(value=False)
         self.var_enhance = tk.BooleanVar(value=False)
-        for text, var in [("倾斜校正", self.var_deskew),
-                          ("版心居中", self.var_center),
-                          ("每页各自居中\n（不参照全书标准版心）", self.var_per_page),
-                          ("版心外涂成纸色\n（去黑边、阴影）", self.var_clean),
-                          ("黑白页旋转时 2 倍分辨率\n（笔画更平滑，体积变大）", self.var_upscale),
-                          ("显示增强\n（只增强能明显改善的页）", self.var_enhance)]:
-            lock(ttk.Checkbutton(box, text=text, variable=var, command=self.schedule_preview))
-            self.lockable[-1].pack(anchor="w", **pad)
+        self.var_flatten = tk.BooleanVar(value=False)
+        self.option_checks = {}             # {Options 字段名: 勾选框}，按书的类型决定显示哪些（apply_book_type）
+        for name, text, var in [("deskew", "倾斜校正", self.var_deskew),
+                                ("center", "版心居中", self.var_center),
+                                ("per_page", "每页各自居中\n（不参照全书标准版心）", self.var_per_page),
+                                ("clean_margin", "版心外涂成纸色\n（去黑边、阴影）", self.var_clean),
+                                ("upscale", "黑白页旋转时 2 倍分辨率\n（笔画更平滑，体积变大）", self.var_upscale),
+                                ("enhance", "显示增强\n（只增强能明显改善的页）", self.var_enhance),
+                                ("flatten", "纸面找平\n（纸色拉白，去掉页边的灰影）", self.var_flatten)]:
+            self.option_checks[name] = ttk.Checkbutton(box, text=text, variable=var, command=self.schedule_preview)
+            lock(self.option_checks[name])
+        self.option_pad = pad
+        self.apply_book_type()
 
         box = ttk.LabelFrame(side, text="参数")
         box.pack(fill="x", pady=(0, 6))
@@ -163,10 +182,10 @@ class App(tk.Tk):
         # 分析完全书后在这里显示各个参数的建议值（每项一行提示，没有建议的不显示）
         self.rec = {}                       # {"min_angle" / "quality" / "max_angle" / "dpi": 建议值或 None}
         self.rec_labels = {}
-        for k, name in enumerate(("max_angle", "min_angle", "quality", "dpi")):
+        for k, name in enumerate(("max_angle", "min_angle", "quality", "dpi", "flatten")):
             label = ttk.Label(box, text="", foreground="#0a58ca", wraplength=190, justify="left")
             self.rec_labels[name] = label
-        self.rec_button_row = len(rows) + 4
+        self.rec_button_row = len(rows) + 5
         # 一个按钮管所有的建议值：「采用建议值」↔「恢复默认值」
         self.btn_recommend = ttk.Button(box, text="采用建议值", command=self.toggle_recommendation)
         lock(self.btn_recommend)
@@ -178,8 +197,8 @@ class App(tk.Tk):
         self.lockable[-1].pack(fill="x", **pad)
         ttk.Label(box, text="例: 1-20 或 3,5,8-12\n留空 = 全部页", foreground="#666").pack(anchor="w", **pad)
 
-        # 分析结果是从历史记录里恢复的（不是这次现算的）时才显示：原文件内容变了、或者想重新来过时用
-        self.btn_reanalyze = ttk.Button(side, text="重新分析", command=self.reanalyze)
+        # 打开文件后不自动分析（用户要求：先选类型、设好参数）。没分析过时叫「分析全书」，分析过了叫「重新分析」
+        self.btn_reanalyze = ttk.Button(side, text="分析全书", command=self.reanalyze)
         self.btn_run = ttk.Button(side, text="开始处理", command=self.run, state="disabled")
         self.btn_run.pack(fill="x", pady=(6, 3), ipady=6)
         self.btn_cancel = ttk.Button(side, text="取消", command=self.cancel, state="disabled")
@@ -304,13 +323,27 @@ class App(tk.Tk):
             except (tk.TclError, ValueError):
                 return default
         return core.Options(
+            book=self.var_book.get(),
             deskew=self.var_deskew.get(), center=self.var_center.get(),
             per_page=self.var_per_page.get(), clean_margin=self.var_clean.get(),
-            upscale=self.var_upscale.get(), enhance=self.var_enhance.get(),
+            upscale=self.var_upscale.get(), enhance=self.var_enhance.get(), flatten=self.var_flatten.get(),
             max_angle=max(num(self.var_max_angle, 5.0, float), 0.5),
             min_angle=max(num(self.var_min_angle, 0.1, float), 0.0),
             dpi=min(max(num(self.var_dpi, 300, int), 72), 1200),
-            quality=min(max(num(self.var_quality, 90, int), 1), 100))
+            quality=min(max(num(self.var_quality, 90, int), 1), 100)).effective()   # 藏起来的选项一律按关闭
+
+    def apply_book_type(self):
+        """按书的类型显示对应的「修正内容」选项；建议值的提示也跟着换。藏起来的勾选框可能还勾着，
+        Options.effective 会统一屏蔽，这里只管显示。"""
+        book = self.var_book.get()
+        self.var_book_label.set(core.BOOK_TYPES.get(book, core.BOOK_TYPES["text"]))
+        for check in self.option_checks.values():
+            check.pack_forget()
+        for name in core.BOOK_OPTIONS.get(book, core.BOOK_OPTIONS["text"]):
+            self.option_checks[name].pack(anchor="w", **self.option_pad)
+        if self.infos is not None and self.analysis_key is not None:
+            self.show_recommendation()      # 漫画多一项「纸面找平」的建议，文字书没有
+        self.schedule_preview()
 
     def show_recommendation(self):
         try:                                # 抽查原文件的压缩方式（只读十几张图的文件头，很快）
@@ -318,17 +351,17 @@ class App(tk.Tk):
                 profile = core.source_profile(doc, self.infos)
         except Exception:
             profile = None
-        rec = core.format_recommendation(self.infos, profile, self.analysis_key[1])
-        self.rec = {name: rec[name] for name in ("max_angle", "min_angle", "quality", "dpi")}
+        rec = core.format_recommendation(self.infos, profile, self.analysis_key[1], book=self.var_book.get())
+        self.rec = {name: rec[name] for name in ("max_angle", "min_angle", "quality", "dpi", "flatten")}
         for line in rec["lines"]:
             self.write_log(line)
-        self.write_log(core.enhancement_summary(self.infos))
         self.update_recommend_label()
 
     # (参数名, 名称, 单位, 是否「安静」)。安静的参数只在有事可做时才显示提示——
     # 绝大多数书的倾斜检测范围和渲染 DPI 用默认值就对，不值得每次都占一行
     REC_ROWS = (("max_angle", "倾斜检测范围", "°", True), ("min_angle", "不旋转角度", "°", False),
-                ("quality", "JPEG 质量", "", False), ("dpi", "渲染 DPI", "", True))
+                ("quality", "JPEG 质量", "", False), ("dpi", "渲染 DPI", "", True),
+                ("flatten", "纸面找平", "", True))      # 开关类：建议值是 True/False
 
     def recommendation_rows(self):
         """[(参数名, 名称, 单位, 安静, 界面变量, 当前值, 建议值, 默认值), ...]，只含本书有建议值的参数。"""
@@ -339,6 +372,14 @@ class App(tk.Tk):
                 rows.append((name, title, unit, quiet, getattr(self, "var_" + name),
                              getattr(opts, name), self.rec[name], getattr(defaults, name)))
         return rows
+
+    @staticmethod
+    def rec_same(a, b):
+        return a == b if isinstance(a, bool) else abs(a - b) < 1e-9
+
+    @staticmethod
+    def rec_text(value, unit):
+        return ("开启" if value else "关闭") if isinstance(value, bool) else f"{value:g}{unit}"
 
     def update_recommend_label(self):
         """建议值的提示和按钮要跟着当前设置值走：用户手动改了数值，它们也得变。
@@ -351,16 +392,17 @@ class App(tk.Tk):
         rows = self.recommendation_rows()
         line = 4
         for name, title, unit, quiet, _var, current, recommended, default in rows:
-            adopted = abs(current - recommended) < 1e-9
-            if quiet and adopted and abs(recommended - default) < 1e-9:
+            adopted = self.rec_same(current, recommended)
+            if quiet and adopted and self.rec_same(recommended, default):
                 continue
-            text = (f"{title}: 当前值 {recommended:g}{unit} 即为建议值" if adopted
-                    else f"{title}: 建议 {recommended:g}{unit}（理由见下方日志）")
+            shown = self.rec_text(recommended, unit)
+            text = (f"{title}: 当前值 {shown} 即为建议值" if adopted
+                    else f"{title}: 建议 {shown}（理由见下方日志）")
             self.rec_labels[name].configure(text=text)
             self.rec_labels[name].grid(row=line, column=0, columnspan=2, sticky="w", padx=6, pady=3)
             line += 1
-        all_adopted = all(abs(r[5] - r[6]) < 1e-9 for r in rows)
-        same_as_default = all(abs(r[6] - r[7]) < 1e-9 for r in rows)
+        all_adopted = all(self.rec_same(r[5], r[6]) for r in rows)
+        same_as_default = all(self.rec_same(r[6], r[7]) for r in rows)
         if not rows or (all_adopted and same_as_default):
             self.btn_recommend.grid_forget()
         else:
@@ -370,7 +412,7 @@ class App(tk.Tk):
 
     def toggle_recommendation(self):
         rows = self.recommendation_rows()
-        all_adopted = all(abs(r[5] - r[6]) < 1e-9 for r in rows)
+        all_adopted = all(self.rec_same(r[5], r[6]) for r in rows)
         for _name, _title, _unit, _quiet, var, _current, recommended, default in rows:
             value = default if all_adopted else recommended
             var.set(int(value) if isinstance(var, tk.IntVar) else value)
@@ -382,7 +424,7 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ 进度的保存与恢复
 
-    OPTION_VARS = ("deskew", "center", "per_page", "clean", "upscale", "enhance",
+    OPTION_VARS = ("book", "deskew", "center", "per_page", "clean", "upscale", "enhance", "flatten",
                    "max_angle", "min_angle", "quality", "dpi")
 
     def save_state(self):
@@ -411,7 +453,7 @@ class App(tk.Tk):
 
     def restore_state(self, book):
         for name, value in Store.options_of(book).items():
-            if name in self.OPTION_VARS:
+            if name in self.OPTION_VARS and (name != "book" or value in core.BOOK_TYPES):
                 getattr(self, "var_" + name).set(value)
         # 以前保存的如果只是旧版的默认文件名（_reshaped），就换成现在的默认名；用户自己起的名字不动
         old_default = Path(book["path"]).with_name(Path(book["path"]).stem + "_reshaped.pdf")
@@ -672,7 +714,7 @@ class App(tk.Tk):
         except ValueError:
             return
         key = (self.analysis_key, opts.deskew, opts.center, opts.per_page, opts.clean_margin, opts.upscale, opts.enhance,
-               opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices),
+               opts.flatten, opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices),
                tuple(sorted(self.adjust.items())), tuple(sorted(self.align.items())), frozenset(self.cleanup))
         if key == self.estimate_key or not indices:
             return
@@ -776,19 +818,24 @@ class App(tk.Tk):
                                f"微调版心 {len(self.adjust)} 页"
                                + ("、全书分析结果。" if infos else "。分析结果需要重新生成。"))
         self.update_skip_label()
-        self.btn_reanalyze.pack_forget()
+        self.btn_reanalyze.pack(fill="x", pady=(6, 0), before=self.btn_run)
         if infos:
             self.infos, self.ref = infos, core.compute_reference(infos)
             self.attach_adjust()
             self.analysis_key = self.current_key(self.get_options())
-            self.btn_reanalyze.pack(fill="x", pady=(6, 0), before=self.btn_run)
             self.progress.configure(value=100)
             self.lbl_status.configure(text="已恢复上次的进度。可以继续翻页调整，确认后点「开始处理」。")
             self.show_recommendation()
         else:
-            self.write_log("开始分析全书…")
-            self.start_analysis()
+            # 不自动分析（用户要求）：先选好书的类型、设好参数，再点「分析全书」；直接点「开始处理」也会先分析
+            self.progress.configure(value=0)
+            self.lbl_status.configure(text="请选择书的类型、设好参数，然后点「分析全书」（或直接点「开始处理」）。")
+        self.update_analyze_button()
         self.schedule_preview()
+
+    def update_analyze_button(self):
+        analyzed = self.infos is not None and self.analysis_key == self.current_key(self.get_options())
+        self.btn_reanalyze.configure(text="重新分析" if analyzed else "分析全书")
 
     # ------------------------------------------------------------ 分析 / 处理（工作线程）
 
@@ -818,7 +865,7 @@ class App(tk.Tk):
         self.estimate_key, self.estimate_cache, self.estimate_running = None, {}, False
         self.lbl_estimate.configure(text="")
         self.progress.configure(value=0)
-        self.write_log("重新分析全书…")
+        self.write_log("分析全书…")
         self.start_analysis()
         self.schedule_preview()
 
@@ -904,7 +951,8 @@ class App(tk.Tk):
         """
         self.locked = locked
         for widget in self.lockable:
-            widget.configure(state="disabled" if locked else "normal")
+            # 下拉框平时是「只读」（只能选、不能打字），恢复成 normal 就能打字了
+            widget.configure(state="disabled" if locked else "readonly" if isinstance(widget, ttk.Combobox) else "normal")
         self.btn_reanalyze.configure(state="disabled" if locked else "normal")
         for btn in (self.btn_run, self.btn_skip, self.btn_delete):
             btn.configure(state="normal" if self.page_count and not locked else "disabled")
@@ -1169,6 +1217,7 @@ class App(tk.Tk):
     def _idle(self):
         self.set_locked(False)
         self.btn_cancel.configure(state="disabled")
+        self.update_analyze_button()
 
     def _poll(self):
         try:

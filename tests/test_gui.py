@@ -32,11 +32,13 @@ def page_array(path, index, dpi=50):
 
 def basic(d):
     """打开 → 后台分析 → 预览 → 处理输出。"""
-    d.open(fixtures()["h.pdf"])
-    d.check(d.busy(), "打开文件后应立即在后台开始分析全书")
+    d.open(fixtures()["h.pdf"], analyze=False)
+    d.check(not d.busy() and d.app.btn_reanalyze.cget("text") == "分析全书", "打开文件后不应自动分析，等用户点「分析全书」")
     d.check(d.app.var_output.get().endswith("h（校正版）.pdf"), "输出文件名默认是「原文件名（校正版）.pdf」")
+    d.click(d.app.btn_reanalyze)
+    d.check(d.busy(), "点「分析全书」后应在后台开始分析")
     yield d.idle
-    d.check(not d.app.btn_reanalyze.winfo_manager(), "分析是现做的，不应出现「重新分析」按钮")
+    d.check(d.app.btn_reanalyze.cget("text") == "重新分析", "分析过之后按钮应变成「重新分析」")
     d.goto(4)
     yield d.previewed
     d.check("旋转 -3.80°" in d.status(), f"第 4 页的状态应显示旋转 -3.80°，实际: {d.status()}")
@@ -175,7 +177,7 @@ def recommend(d):
     app = d.app
     d.open(fixtures()["wide.pdf"])
     yield d.idle
-    d.check(app.rec == {"max_angle": 8.0, "min_angle": 0.2, "quality": 90, "dpi": 150}, f"建议值不对: {app.rec}")
+    d.check(app.rec == {"max_angle": 8.0, "min_angle": 0.2, "quality": 90, "dpi": 150, "flatten": None}, f"建议值不对: {app.rec}")
     shown = {n for n, label in app.rec_labels.items() if label.winfo_manager()}
     d.check(shown == {"max_angle", "min_angle", "quality", "dpi"}, f"四项都有事可做，都应显示提示，实际 {shown}")
     d.check(app.btn_recommend.cget("text") == "采用建议值", "有一项不是建议值时按钮应为「采用建议值」")
@@ -478,6 +480,56 @@ def files(d):
             f"记录里存的是旧版的默认名 _reshaped，应换成新的默认名，实际 {app.var_output.get()}")
 
 
+def book(d):
+    """书的类型：文字书/漫画书显示不同的选项、给不同的建议；类型和「纸面找平」随书保存；换类型不用重新分析。"""
+    app = d.app
+    shown = lambda: [n for n, c in app.option_checks.items() if c.winfo_manager()]
+    d.open(fixtures()["manga.pdf"], analyze=False)
+    d.check(app.var_book.get() == "text" and "enhance" in shown() and "flatten" not in shown(),
+            f"默认是文字书，应显示「显示增强」、不显示「纸面找平」，实际 {shown()}")
+    app.var_book.set("manga")
+    d.check(app.var_book_label.get() == "漫画书", "下拉框的文字应跟着类型变")
+    d.check("flatten" in shown() and "enhance" not in shown() and "upscale" not in shown(),
+            f"漫画书应显示「纸面找平」、不显示黑白页的两项，实际 {shown()}")
+    d.check(not d.busy(), "换类型不需要重新分析")
+    d.click(app.btn_reanalyze)
+    yield d.idle
+    yield d.previewed
+    d.check("纸面找平: 建议 开启" in app.rec_labels["flatten"].cget("text") and app.rec_labels["flatten"].winfo_manager(),
+            f"漫画有灰影的页多，应建议开启「纸面找平」，实际: {app.rec_labels['flatten'].cget('text')}")
+    d.check("「纸面找平」建议开启" in d.log() and "「显示增强」" not in d.log(), "漫画的日志里应有找平的说明、没有显示增强的说明")
+    d.check(not app.var_flatten.get() and app.btn_recommend.cget("text") == "采用建议值", "开关类的建议也走同一个按钮")
+    d.click(app.btn_recommend)
+    d.check(app.var_flatten.get(), "「采用建议值」应把「纸面找平」勾上")
+    yield d.previewed
+    d.check("纸面找平" in d.status(), f"有灰影的页处理时应做找平，实际: {d.status()}")
+    d.goto(5)
+    yield d.previewed
+    d.check("纸面找平（灰影 0 级）" in d.status(), f"纸面均匀的页也找平（页与页才一致），实际: {d.status()}")
+    d.goto(1)
+    app.var_enhance.set(True)                                   # 藏起来的选项就算勾着也不生效
+    d.check(not d.app.get_options().enhance and d.app.get_options().flatten, "漫画书下「显示增强」应视为关闭")
+
+    app.var_book.set("text")
+    d.check(not d.busy() and app.infos is not None, "换回文字书也不用重新分析")
+    yield d.previewed
+    d.check(not app.rec_labels["flatten"].winfo_manager() and "纸面找平" not in d.status(),
+            "文字书不显示找平的建议，也不做找平")
+    app.var_book.set("manga")
+    out = d.process_to("gui_book_out.pdf")
+    yield d.processed
+    d.check("纸面找平" in d.log(), "处理日志里应写明找平")
+    edge = page_array(out, 0, dpi=72)                           # 第 1 页右侧的灰影处理后应变白
+    d.check(np.percentile(edge[:, -6:], 90) >= 248, f"找平后页边应接近纯白，实际 {np.percentile(edge[:, -6:], 90)}")
+
+    d.open(fixtures()["h.pdf"])
+    yield d.idle
+    d.check(app.var_book.get() == "text" and not app.var_flatten.get(), "换一本书应回到默认的类型")
+    d.open(fixtures()["manga.pdf"])
+    d.check(app.var_book.get() == "manga" and app.var_flatten.get() and not d.busy(),
+            f"重新打开漫画应恢复它的类型和选项，实际 {app.var_book.get()} {app.var_flatten.get()}")
+
+
 def prepare_stale(db):
     """准备一条带旧版本分析结果的记录。"""
     import pdf_reshape as pr
@@ -544,6 +596,7 @@ SCENARIOS = [
     ("lock", lock, "gui_lock.db", True, None),
     ("drag", drag, "gui_drag.db", True, None),
     ("files", files, "gui_files.db", True, None),
+    ("book", book, "gui_book.db", True, None),
     ("stale_analysis", stale_analysis, "gui_stale.db", True, prepare_stale),
     ("prune", prune, "gui_prune.db", True, prepare_prune),
 ]

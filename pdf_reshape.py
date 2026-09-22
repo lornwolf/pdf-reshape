@@ -25,7 +25,7 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-ANALYSIS_VERSION = 4        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
+ANALYSIS_VERSION = 5        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
 ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
 FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
 HANGING_TOLERANCE = 0.03    # 全部内容比标准的正文宽出这么多，才认为有东西（页码、页眉）挂在正文外面
@@ -50,6 +50,7 @@ class PageInfo:
     outliers: list | None = None    # 伸出核心版心之外的小块 [(x0, y0, x1, y1), ...]：页码、序号，也可能是污渍
     dense_bbox: tuple | None = None  # 按墨迹密度求出的正文范围 (x0, y0, x1, y1)；见 dense_extent
     enhance: str = ""           # 「显示增强」对这一页适合用的方法，空 = 增强了也没有明显改善；见 assess_enhancement
+    shade: float = 0.0          # 灰度/彩色页：页边的纸色比中部暗多少级（订口阴影）；见 measure_shade
     scan_rect: tuple = (0.0, 0.0, 1.0, 1.0)  # 扫描图在页面中的范围（归一化）
     # 以下两项每次 load_page_image 时重新填写，不依赖保存下来的分析结果
     jpeg_block: int = 0         # 原图是 JPEG 时，它的编码块大小（灰度 8、彩色 16）；不是 JPEG 为 0
@@ -57,18 +58,34 @@ class PageInfo:
     note: str = ""
 
 
+BOOK_TYPES = {"text": "文字书", "manga": "漫画书"}
+# 各类书在界面上显示、在处理中生效的「修正内容」选项。不在列表里的选项对这类书一律视为关闭（Options.effective）
+BOOK_OPTIONS = {"text": ("deskew", "center", "per_page", "clean_margin", "upscale", "enhance"),
+                "manga": ("deskew", "center", "per_page", "clean_margin", "flatten")}
+
+
 @dataclass
 class Options:
+    book: str = "text"          # 书的类型：text 文字书 / manga 漫画书。决定哪些选项可用、给哪些建议
     deskew: bool = True         # 倾斜校正
     center: bool = True         # 版心居中
     per_page: bool = False      # 每页各自居中（不参照全书标准版心）
     clean_margin: bool = False  # 把版心以外涂成纸色
     upscale: bool = False       # 黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）
     enhance: bool = False       # 显示增强：对能有明显改善的黑白页，自动选合适的方法增强显示效果
+    flatten: bool = False       # 纸面找平（漫画）：把灰度/彩色页的纸面按当地纸色拉白，页边的灰影就没了
     max_angle: float = 5.0      # 倾斜检测范围 ±度
     min_angle: float = 0.1      # 小于此角度不旋转
     dpi: int = 300              # 无法直接取原图的页面的渲染 DPI
     quality: int = 90           # JPEG 质量
+
+    def effective(self):
+        """按书的类型把不适用的选项关掉之后的副本：文字书没有「纸面找平」，漫画没有「显示增强」等。
+        界面上换了类型，藏起来的勾选框可能还勾着，所以一律在这里统一屏蔽，核心函数不用各自判断。"""
+        allowed = BOOK_OPTIONS.get(self.book, BOOK_OPTIONS["text"])
+        fields = {name: getattr(self, name) for name in ("deskew", "center", "per_page", "clean_margin",
+                                                          "upscale", "enhance", "flatten")}
+        return Options(**{**self.__dict__, **{name: value and name in allowed for name, value in fields.items()}})
 
 
 def default_output_path(input_path):
@@ -632,6 +649,110 @@ def compute_shift(info, ref, per_page):
 
 # ---------------------------------------------------------------- 输出
 
+def paper_tone(img):
+    """去污用的纸面估计：每一处「没有墨迹的纸面」长什么样（和 img 同样大小、同样的通道数）。
+
+    做一次大核的闭运算（先膨胀后腐蚀），比核小的深色东西——文字、污点、黑边、阴影——都会被
+    周围的纸色填平；平缓的明暗变化则原样保留。纸面的变化很平缓，缩小 4 倍算，快 16 倍。
+    核的半径要明显大于黑边的宽度，最靠边的像素才够得着里面的纸色：12% 的核能填平宽度在页面 5% 以内、
+    笔直贴着页边的黑边（6% 的核对 3% 宽的黑边刚好差一两列像素，没旋转的页上露过馅）。
+    **不能用来找平**：缩小之后网点糊成一片浅灰，闭运算看不到点与点之间的白，整片天空会被当成
+    发灰的纸面拉亮，网点拉成格子（用户报的）。找平用 paper_map。
+    """
+    h, w = img.shape[:2]
+    f = 4
+    small = cv2.resize(img, (max(w // f, 1), max(h // f, 1)), interpolation=cv2.INTER_AREA)
+    k = max(int(0.12 * min(small.shape[:2])) | 1, 9)
+    paper = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    return cv2.resize(cv2.GaussianBlur(paper, (k, k), 0), (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def paper_map(gray, cells=(64, 48)):
+    """找平用的纸面估计（灰度，和 gray 同样大小）：把页面分成 cells = (行数, 列数) 个小格，每格取
+    最亮的 5% 像素的亮度当这一格的纸色。
+
+    在原分辨率上做、不缩小：网点之间的白缝就是纸，只有在原分辨率上才看得见（缩小后点和缝混成一片
+    浅灰）。文字、排线、网点占不满一格，最亮的 5% 总是纸；整格实心黑（估出来不够亮的格子）不算，
+    由周围的格子插值。格子要比订口阴影窄得多（阴影占页宽 5%～10%），48 列每列约 2%：一格里阴影的
+    变化不到几级，最亮的 5% 才代表得了这一格；格子再大，页边那一格估出来的是它靠里的一侧，页边就找不平。
+    最后略作平滑再放大回原大小，纸色是平缓变化的，不会出现格子的边。
+    """
+    h, w = gray.shape
+    rows, cols = cells
+    ch, cw = -(-h // rows), -(-w // cols)
+    padded = cv2.copyMakeBorder(gray, 0, rows * ch - h, 0, cols * cw - w, cv2.BORDER_REFLECT)
+    blocks = padded.reshape(rows, ch, cols, cw).transpose(0, 2, 1, 3).reshape(rows, cols, -1)
+    paper = np.percentile(blocks, 95, axis=2).astype(np.float32)
+    valid = (paper >= PAPER_MIN).astype(np.float32)
+    if valid.sum() == 0:
+        return np.full((h, w), float(np.median(paper)), np.float32)
+    # 实心黑的格子用周围有纸的格子填（归一化卷积：先只对有效格子求加权平均）
+    k = 0
+    filled = paper * valid
+    weight = valid.copy()
+    while (weight == 0).any() and k < 6:
+        k += 1
+        filled = cv2.GaussianBlur(paper * valid, (2 * k + 1,) * 2, 0, borderType=cv2.BORDER_REPLICATE)
+        weight = cv2.GaussianBlur(valid, (2 * k + 1,) * 2, 0, borderType=cv2.BORDER_REPLICATE)
+        filled = np.where(weight > 0, filled / np.maximum(weight, 1e-6), 0)
+        paper, valid = np.where(valid > 0, paper, filled), np.maximum(valid, (weight > 0).astype(np.float32))
+    paper = np.where(valid > 0, paper, float(np.median(paper[valid > 0])))
+    paper = cv2.GaussianBlur(paper, (3, 3), 0, borderType=cv2.BORDER_REPLICATE)
+    return cv2.resize(paper, (w, h), interpolation=cv2.INTER_CUBIC)
+
+
+PAPER_MIN = 160             # 估出的纸色至少这么亮才算纸：更暗的是比闭运算的核还大的实心黑块，不是纸
+FLATTEN_MIN_SHADE = 12      # 页边的纸色比中部暗这么多级以上，「纸面找平」才有明显的改善
+
+
+def measure_shade(gray, scan_rect=(0.0, 0.0, 1.0, 1.0)):
+    """灰度/彩色页：页边的纸色比中部暗多少级（0 = 均匀）。在分析用的缩略图上量，只看扫描图的范围。
+
+    漫画扫描件常有一道订口阴影（页宽的 5%～10%，二三十级），每页位置固定，看着灰蒙蒙的；
+    「纸面找平」就是冲它来的，所以分析时先量出来，找平只给有明显灰影的页，建议值也据此而定。
+    四条边各取一条 8% 宽的带子，和中部比；带子里估出的纸色不够亮的（整格实心黑）不算。
+    """
+    h, w = gray.shape
+    x0, y0 = int(scan_rect[0] * w), int(scan_rect[1] * h)
+    area = gray[y0:int(scan_rect[3] * h), x0:int(scan_rect[2] * w)]
+    if min(area.shape) < 40:
+        return 0.0
+    paper = paper_map(area)
+    ah, aw = paper.shape
+    center = paper[int(0.3 * ah):int(0.7 * ah), int(0.3 * aw):int(0.7 * aw)]
+    center = center[center >= PAPER_MIN]
+    if center.size < 100:
+        return 0.0
+    mid = float(np.median(center))
+    bx, by = max(int(0.08 * aw), 1), max(int(0.08 * ah), 1)
+    darkest = mid
+    for band in (paper[:, :bx], paper[:, -bx:], paper[:by, :], paper[-by:, :]):
+        lit = band[band >= PAPER_MIN]
+        if lit.size >= 0.2 * band.size:
+            darkest = min(darkest, float(np.median(lit)))
+    return max(mid - darkest, 0.0)
+
+
+def flatten_paper(img):
+    """「纸面找平」：每一处按「当地的纸色 → 白」拉亮。页边的灰影没了，页与页的观感一致，
+    墨线、网点相对纸面的深浅不变（是乘一个系数，不是加减）。不做二值化、不锐化——漫画的网点经不起。
+    纸色用 paper_map 估：实心黑的地方按周围的纸色算，乘上去仍然是黑，中等的灰和周围一样略微拉亮。"""
+    paper = np.maximum(paper_map(to_gray(img)), 128.0)
+    gain = 255.0 / paper
+    if img.ndim == 3:
+        gain = gain[..., None]
+    return np.clip(img.astype(np.float32) * gain + 0.5, 0, 255).astype(np.uint8)
+
+
+def flatten_of(info, opts, skip=False):
+    """这一页要不要做纸面找平：选项开着、是灰度/彩色页、用户没有指定「本页不修正」。
+
+    不按 info.shade 逐页取舍：找平不像显示增强那样有体积的代价，而漫画要的是页与页一致——
+    只找平有灰影的页，翻到没灰影的页纸色就从白跳回灰。灰影的多少只用来给建议（recommend_flatten）。
+    """
+    return bool(opts.flatten and not info.bilevel and not skip and info.mode != "copy")
+
+
 def remove_margin_stains(img, rect, bilevel):
     """把 rect (x0, y0, x1, y1，像素) 以外疑似墨迹的地方，按周围干净纸面的颜色重新画上。就地修改 img。
 
@@ -647,13 +768,7 @@ def remove_margin_stains(img, rect, bilevel):
     if bilevel:
         img[outside] = 255
         return img
-    f = 4                                               # 纸面的明暗变化很平缓，缩小 4 倍算，快 16 倍
-    small = cv2.resize(img, (max(w // f, 1), max(h // f, 1)), interpolation=cv2.INTER_AREA)
-    # 核的半径要明显大于黑边的宽度，最靠边的像素才够得着里面的纸色：12% 的核能填平宽度在页面
-    # 5% 以内、笔直贴着页边的黑边（6% 的核对 3% 宽的黑边刚好差一两列像素，没旋转的页上露过馅）
-    k = max(int(0.12 * min(small.shape[:2])) | 1, 9)
-    paper = cv2.morphologyEx(small, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-    paper = cv2.resize(cv2.GaussianBlur(paper, (k, k), 0), (w, h), interpolation=cv2.INTER_LINEAR)
+    paper = paper_tone(img)
     stain = (to_gray(paper).astype(np.int16) - to_gray(img).astype(np.int16)) > 24
     stain = cv2.dilate((stain & outside).astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) & outside
     img[stain] = paper[stain]
@@ -884,12 +999,15 @@ def render_page(doc, info, ref, opts, angle, shift, skip=False):
     """取图、变换、增强，得到这一页最终的图像。返回 (图像, 实际用的增强方法)。"""
     method = enhancement_of(info, opts, skip)
     grow = enhancement_scale(method)                             # 增强本身要的放大，旋转不旋转都照做
+    flat = flatten_of(info, opts, skip)
     scale = max(grow, 2 if opts.upscale and info.bilevel else 1)
     if angle == 0.0:
         # 不旋转的页 transform_image 不理会「2 倍分辨率」，出来的图只放大了 grow 倍。这里要跟着改，
         # 否则只去噪点的页会把原尺寸的图当成放大过的：白白糊一遍，噪点的尺寸上限也大了 4 倍
         scale = grow
     source = load_page_image(doc, doc[info.index], info, opts.dpi)
+    if flat:                                        # 先找平再变换：旋转补的边就是白的
+        source = flatten_paper(source)
     # 不修正的页不受全局的「版心外涂成纸色」影响；它只接受用户逐页指定的去污
     kwargs = dict(scale=scale, bbox=content_box(info, ref), cleanup=cleanup_box(info, ref), keep_scale=grow > 1)
     img = transform_image(source, info, angle, shift, opts.clean_margin and not skip, **kwargs)
@@ -930,6 +1048,14 @@ def enhancement_summary(infos):
     return f"「显示增强」：{len(bilevel)} 页黑白页里有 {len(chosen)} 页可以明显改善（{detail}）。"
 
 
+def flatten_summary(infos):
+    """分析完之后关于「纸面找平」的一句话（漫画）。"""
+    value, reason = recommend_flatten(infos)
+    if value is None:
+        return reason + "。"
+    return ("「纸面找平」建议开启：" if value else "「纸面找平」不需要：") + reason + "。"
+
+
 def encode_image(img, bilevel, quality):
     if bilevel:
         # 原图是黑白二值：重新二值化后存成 1bit PNG，保持锐利且体积小
@@ -959,6 +1085,11 @@ def analyze_page(doc, index, opts):
     analyze(img, info, opts.max_angle)
     if info.bbox and info.bilevel:
         info.enhance = assess_enhancement(to_gray(img), info.dpi)
+    elif info.bbox:
+        gray = to_gray(img)
+        scale = ANALYSIS_LONG_SIDE / max(gray.shape)
+        small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else gray
+        info.shade = round(measure_shade(small, info.scan_rect), 1)
     return info
 
 
@@ -1139,14 +1270,30 @@ def recommend_dpi(profile):
                    f"改了这一项需要重新分析")
 
 
-def format_recommendation(infos, profile=None, max_angle=5.0):
-    """把建议整理成 {"min_angle", "quality", "max_angle", "dpi": 值或 None, "lines": [几行说明]}。
+def recommend_flatten(infos):
+    """给「纸面找平」（漫画）提建议。返回 (True / False / None, 理由)；None 表示这一项对本书不起作用。"""
+    pages = [p for p in infos if p.bbox and not p.bilevel]
+    if not pages:
+        return None, "本书没有灰度/彩色页，「纸面找平」不起作用"
+    shades = np.array([p.shade for p in pages])
+    shaded = shades[shades >= FLATTEN_MIN_SHADE]
+    if len(shaded) >= max(3, 0.1 * len(pages)):
+        return True, (f"{len(pages)} 页灰度/彩色页里有 {len(shaded)} 页的页边纸色比中部暗 {FLATTEN_MIN_SHADE} 级以上"
+                      f"（中位 {np.median(shaded):.0f} 级，多半是订口阴影），找平后页面均匀、页与页观感一致，"
+                      f"墨线和网点相对纸面的深浅不变")
+    return False, f"纸面已经均匀（页边和中部的纸色最多差 {shades.max():.0f} 级），找平没有明显的改善"
 
-    命令行和界面共用。max_angle 是产生 infos 的那次分析用的倾斜检测范围。
+
+def format_recommendation(infos, profile=None, max_angle=5.0, book="text"):
+    """把建议整理成 {"min_angle", "quality", "max_angle", "dpi", "flatten": 值或 None, "lines": [几行说明]}。
+
+    命令行和界面共用。max_angle 是产生 infos 的那次分析用的倾斜检测范围。book 是书的类型：
+    漫画多一项「纸面找平」的建议，文字书没有（这一项对文字书不显示）。
     """
+    empty = {"min_angle": None, "quality": None, "max_angle": None, "dpi": None, "flatten": None, "lines": []}
     rec = recommend_min_angle(infos, profile)
     if rec is None:
-        return {"min_angle": None, "quality": None, "max_angle": None, "dpi": None, "lines": []}
+        return empty
     value, reason, counts = rec
     total = sum(1 for p in infos if p.bbox)
     lines = ["倾斜分布：" + "  ".join(f"≥{t}°: {n} 页" for t, n in counts) + f"  （共 {total} 页）"]
@@ -1168,7 +1315,13 @@ def format_recommendation(infos, profile=None, max_angle=5.0):
         lines.append(f"「渲染 DPI」建议设为 {dpi}：{d_reason}。")
     elif d_reason:
         lines.append(d_reason + "。")
-    return {"min_angle": value, "quality": quality, "max_angle": wide, "dpi": dpi, "lines": lines}
+    flatten = None
+    if book == "manga":
+        flatten = recommend_flatten(infos)[0]
+        lines.append(flatten_summary(infos))
+    else:
+        lines.append(enhancement_summary(infos))
+    return {"min_angle": value, "quality": quality, "max_angle": wide, "dpi": dpi, "flatten": flatten, "lines": lines}
 
 
 def plan_page(info, ref, opts, skip=False):
@@ -1189,13 +1342,15 @@ def plan_page(info, ref, opts, skip=False):
     trivial = angle == 0.0 and max(abs(shift[0]), abs(shift[1])) < 0.003
     cleanup = cleanup_box(info, ref) is not None
     method = enhancement_of(info, opts)
-    untouched = info.mode == "copy" or (trivial and not opts.clean_margin and not cleanup and not method)
+    flat = flatten_of(info, opts)
+    untouched = info.mode == "copy" or (trivial and not opts.clean_margin and not cleanup and not method and not flat)
     if untouched:
         status = info.note or "无需修正"
     else:
         status = (f"旋转 {angle:+.2f}°  平移 x{shift[0] * 100:+.1f}% y{shift[1] * 100:+.1f}%"
                   + ("  去除边缘污染" if cleanup else "")
                   + (f"  显示增强: {describe_enhancement(method)}" if method else "")
+                  + (f"  纸面找平（灰影 {info.shade:.0f} 级）" if flat else "")
                   + (f"  ({info.note})" if info.note else ""))
     return angle, shift, untouched, status
 
@@ -1208,6 +1363,7 @@ def process_document(doc, infos, opts, output, progress=None, log=None, cancelle
     skip_pages 是用户指定「不做修正」的页（从 0 开始的页序）。
     delete_pages 是用户指定删除的页：不输出到新 PDF（原文件不受影响），目录书签的页码相应前移。
     """
+    opts = opts.effective()
     ref = ref or compute_reference(infos)
     kept = [info.index for info in infos if info.index not in delete_pages]
     if not kept:
@@ -1271,6 +1427,7 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
     PDF 自己的流，1bit 黑白页因此会小 25% 左右。所以把抽样页真的写进一个内存里的临时 PDF，
     按和正式输出相同的方式保存，以它的实际大小为准。
     """
+    opts = opts.effective()
     cache = cache if cache is not None else {}
     copied_bytes, copied, work = 0, 0, []
     for info in infos:
@@ -1293,7 +1450,8 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
     groups = {}
     for item in work:
         skip = item[0].index in skip_pages
-        groups.setdefault((item[1] == 0.0, enhancement_of(item[0], opts, skip)), []).append(item)
+        groups.setdefault((item[1] == 0.0, enhancement_of(item[0], opts, skip), flatten_of(item[0], opts, skip)),
+                          []).append(item)
     for group in groups.values():
         n = min(len(group), max(3, round(samples * len(group) / len(work))))
         step = len(group) / n
@@ -1306,7 +1464,7 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
             skip = info.index in skip_pages
             key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4), opts.clean_margin,
                    opts.upscale, None if info.bilevel else opts.quality, opts.dpi, cleanup_box(info, ref),
-                   enhancement_of(info, opts, skip), skip)
+                   enhancement_of(info, opts, skip), flatten_of(info, opts, skip), skip)
             if key not in cache:                    # 缓存一页单独存成 PDF 的字节，多次预估之间复用
                 single = fitz.open()
                 img, method = render_page(doc, info, ref, opts, angle, shift, skip=skip)
@@ -1350,6 +1508,7 @@ def remap_toc(toc, kept):
 def preview_page(doc, info, ref, opts, skip=False):
     """生成单页的处理前/处理后图像（供图形界面预览）。"""
     page = doc[info.index]
+    opts = opts.effective()
     angle, shift, untouched, status = plan_page(info, ref, opts, skip)
     render_info = info if info.mode != "copy" else PageInfo(index=info.index, mode="render")
     before = load_page_image(doc, page, render_info, 100 if info.mode == "copy" else opts.dpi)
@@ -1409,12 +1568,16 @@ def main():
                     help="显示增强：对能有明显改善的黑白页，自动选合适的方法（平滑放大、去噪点、矢量化）")
     ap.add_argument("--upscale", action="store_true",
                     help="黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）")
+    ap.add_argument("--book", choices=list(BOOK_TYPES), default="text",
+                    help="书的类型：text 文字书（默认）/ manga 漫画书。漫画可用 --flatten，不用 --enhance/--upscale")
+    ap.add_argument("--flatten", action="store_true",
+                    help="纸面找平（漫画）：把页边的灰影（订口阴影）按当地纸色拉白，只对有明显灰影的灰度页")
     args = ap.parse_args()
 
     output = args.output or default_output_path(args.input)
-    opts = Options(deskew=not args.no_deskew, center=not args.no_center, per_page=args.per_page,
-                   clean_margin=args.clean_margin, upscale=args.upscale, enhance=args.enhance, max_angle=args.max_angle,
-                   min_angle=args.min_angle or 0.0, dpi=args.dpi, quality=args.quality or 90)
+    opts = Options(book=args.book, deskew=not args.no_deskew, center=not args.no_center, per_page=args.per_page,
+                   clean_margin=args.clean_margin, upscale=args.upscale, enhance=args.enhance, flatten=args.flatten,
+                   max_angle=args.max_angle, min_angle=args.min_angle or 0.0, dpi=args.dpi, quality=args.quality or 90)
     doc = fitz.open(args.input)
     indices = parse_pages(args.pages, doc.page_count)
 
@@ -1422,10 +1585,9 @@ def main():
         doc, indices, opts,
         progress=lambda k, n: print(f"\r分析中 {k}/{n}", end="", flush=True))
     print()
-    rec = format_recommendation(infos, source_profile(doc, infos), opts.max_angle)
+    rec = format_recommendation(infos, source_profile(doc, infos), opts.max_angle, book=opts.book)
     for line in rec["lines"]:
         print(line)
-    print(enhancement_summary(infos))
     if args.min_angle is None:
         opts.min_angle = rec["min_angle"] if rec["min_angle"] is not None else 0.1
         print(f"未指定 --min-angle，采用 {opts.min_angle}°")

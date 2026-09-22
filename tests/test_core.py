@@ -336,6 +336,41 @@ def test_enhance_output():
 
 # ---------------------------------------------------------------- 建议值与大小预估
 
+def test_flatten_paper():
+    """纸面找平：页边的灰影按当地纸色拉白，墨迹、排线相对纸面的深浅不变；实心黑块不动。"""
+    f = Failures()
+    doc, infos, opts = analyzed(fixtures()["manga.pdf"])
+    shades = [p.shade for p in infos]
+    f.check(all(s >= pr.FLATTEN_MIN_SHADE for s in shades[:4]) and max(shades[4:]) < 2,
+            f"前 4 页有灰影、后 2 页没有，实际 {shades}")
+    img = pr.load_page_image(doc, doc[0], infos[0], opts.dpi)
+    flat = pr.flatten_paper(img)
+    g0, g1 = pr.to_gray(img), pr.to_gray(flat)
+    f.check(np.percentile(g1[:, -30:], 90) >= 248 and np.percentile(g1[:, 500:700], 90) >= 250,
+            f"找平后页边和中部的纸色都应接近白，实际 {np.percentile(g1[:, -30:], 90)} / {np.percentile(g1[:, 500:700], 90)}")
+    f.check(float(g1[840:1320, 200:520].mean()) < 40, f"实心黑块乘上系数仍应是黑，实际 {g1[840:1320, 200:520].mean():.1f}")
+    ink0, ink1 = g0[190:660, 160:1080] < 128, g1[190:660, 160:1080] < 128     # 排线区域：墨迹的多少不变
+    f.check(abs(ink1.mean() - ink0.mean()) < 0.01, f"排线不应变粗变细，实际墨迹占比 {ink0.mean():.3f} → {ink1.mean():.3f}")
+
+    f.check(pr.flatten_of(infos[0], pr.Options(book="manga", flatten=True)) and pr.flatten_of(infos[4], pr.Options(book="manga", flatten=True)),
+            "开了找平就每一页灰度页都做，页与页才一致（灰影的多少只用来给建议）")
+    f.check(not pr.flatten_of(infos[0], pr.Options(book="text", flatten=True).effective()), "文字书没有找平这一项")
+    f.check(not pr.Options(book="manga", enhance=True, upscale=True).effective().enhance, "漫画没有显示增强")
+    rec = pr.format_recommendation(infos, pr.source_profile(doc, infos), opts.max_angle, book="manga")
+    f.check(rec["flatten"] is True and any("「纸面找平」建议开启" in l for l in rec["lines"]), f"漫画应建议开启找平，实际 {rec['flatten']}")
+    rec = pr.format_recommendation(infos, pr.source_profile(doc, infos), opts.max_angle, book="text")
+    f.check(rec["flatten"] is None and not any("纸面找平" in l for l in rec["lines"]), "文字书不给找平的建议")
+    rec = pr.format_recommendation(analyzed(fixtures()["mask.pdf"])[1], None, 5.0, book="manga")
+    f.check(rec["flatten"] is None and any("不起作用" in l for l in rec["lines"]), "黑白书没有灰度页，找平不起作用")
+
+    out = work_path("core_manga_out.pdf")
+    pr.process_document(doc, infos, pr.Options(book="manga", flatten=True), out)
+    edge = page_array(out, 0, dpi=72)
+    f.check(np.percentile(edge[:, -6:], 90) >= 248, f"处理后第 1 页的页边应接近纯白，实际 {np.percentile(edge[:, -6:], 90)}")
+    f.close(measure(out)[2]["angle"], 0, 0.11, "找平不影响纠偏")
+    return f
+
+
 def test_recommendations():
     f = Failures()
     doc, infos, opts = analyzed(fixtures()["h.pdf"])
