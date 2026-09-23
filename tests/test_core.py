@@ -123,6 +123,26 @@ def test_skip_delete_cleanup():
     return f
 
 
+def test_clean_margin_only_touches_bilevel_pages():
+    """「版心外去污染」：黑白页版心外的黑边去掉；灰度页不动（用户定的）；不修正的页不受影响。"""
+    f = Failures()
+    doc, infos, _ = analyzed(fixtures()["mask.pdf"])
+    out = work_path("core_clean_mask_out.pdf")
+    pr.process_document(doc, infos, pr.Options(clean_margin=True), out, skip_pages={6})
+    cleaned = page_array(out, 0)                                # 第 1 页带黑边的黑白页
+    f.check(cleaned[:8].min() > 200 and cleaned[:, :8].min() > 200, "黑白页版心外的黑边应被去掉")
+    kept = page_array(out, 6)                                   # 第 7 页也带黑边，但指定了不修正
+    f.check(min(kept[:8].min(), kept[:, :8].min()) < 100, "不修正的页不受全局去污的影响")
+    f.check(not pr.margin_clean_of(infos[0], pr.Options(book="manga", clean_margin=True).effective()), "漫画没有这一项")
+    doc, infos, _ = analyzed(fixtures()["h.pdf"])
+    out = work_path("core_clean_gray_out.pdf")
+    pr.process_document(doc, infos, pr.Options(clean_margin=True), out)
+    gray = page_array(out, 0)                                   # 灰度页：黑边原样保留
+    f.check(min(gray[:8].min(), gray[:, :8].min()) < 100, "灰度页不受全局去污的影响（黑边还在）")
+    f.check(not pr.margin_clean_of(infos[0], pr.Options(clean_margin=True)), "灰度页不算")
+    return f
+
+
 def test_skip_page_can_still_be_cleaned():
     """「本页不修正」管的是位置，不挡「去除边缘污染」（曾经点了没反应）。"""
     f = Failures()
@@ -336,6 +356,39 @@ def test_enhance_output():
 
 # ---------------------------------------------------------------- 建议值与大小预估
 
+def test_keystone():
+    """梯形校正：自动提的四边形接近真实的四个角；按四个角校正后文字行拉平、铺满整页；数据库能保存。"""
+    f = Failures()
+    from make_test import TRAP_QUAD, W, H
+    doc, infos, opts = analyzed(fixtures()["trap.pdf"])
+    ref = pr.compute_reference(infos)
+    img = pr.load_page_image(doc, doc[1], infos[1], opts.dpi)
+    quad = pr.suggest_keystone(img, infos[1].scan_rect)
+    # 上面两个角靠满行的第一行，能提得准；下面两个角只能靠最长的行和短短的末行，偏差大些，留给用户拖
+    for (gx, gy), (tx, ty), tol in zip(quad, TRAP_QUAD, (60, 60, 150, 150)):
+        f.check(abs(gx * W - tx) < tol and abs(gy * H - ty) < tol, f"自动提的角 ({gx * W:.0f}, {gy * H:.0f}) 离真实的 ({tx}, {ty}) 太远")
+    true_quad = tuple((x / W, y / H) for x, y in TRAP_QUAD)
+    ref["keystone"] = {1: true_quad}
+    f.check(pr.plan_page(infos[1], ref, opts)[3].startswith("梯形校正"), "有梯形校正的页状态应写明")
+    f.check(pr.plan_page(infos[1], ref, opts, skip=True)[2] is False, "梯形校正优先于「本页不修正」")
+    doc2, infos2, _ = analyzed(fixtures()["cover.pdf"])         # 「原样复制」的页（铺满整页的封面）也能校正
+    ref2 = pr.compute_reference(infos2)
+    ref2["keystone"] = {0: ((0.02, 0.02), (0.98, 0.03), (0.97, 0.98), (0.03, 0.97))}
+    cover = pr.PageInfo(index=0, mode="copy", note="内容占满整页")   # 真书里铺满整页的封面就是这样
+    f.check(not pr.plan_page(cover, ref2, opts)[2], "原样复制的封面指定了梯形校正后应重新输出")
+    img2 = pr.render_page(doc2, cover, ref2, opts, 0.0, (0.0, 0.0))[0]
+    f.check(img2.ndim == 3 and img2.shape[0] > 1000, f"封面应按渲染取图、彩色输出，实际 {img2.shape}")
+    f.check(pr.preview_page(doc, infos[1], ref, opts)[2] is None, "校正过的页没有红框")
+    out = work_path("core_trap_out.pdf")
+    pr.process_document(doc, infos, opts, out, ref=ref)
+    m = measure(out)[1]
+    f.close(m["angle"], 0, 0.15, "校正后文字行应是平的")
+    f.check(m["left"] < 0.05 and m["right"] < 0.05 and m["top"] < 0.05 and m["bottom"] < 0.05,
+            f"校正后版心应铺满整页，实际边距 {m['left']:.3f} {m['right']:.3f} {m['top']:.3f} {m['bottom']:.3f}")
+    f.close(measure(out)[0]["angle"], 0, 0.11, "其余页照常")
+    return f
+
+
 def test_color_cover_is_left_alone_in_text_books():
     """文字书里画面铺满整页的彩色封面原样保留；带白边的封面和漫画的彩页照常处理。"""
     f = Failures()
@@ -450,6 +503,7 @@ def test_store_roundtrip():
     store.set_page_flag(book["id"], 0, "cleanup", True)
     store.set_box_adjust(book["id"], 2, (-0.02, 0, 0, 0.01))
     store.set_box_adjust(book["id"], 2, (-0.02, 0, 0, 0), column="box_align")
+    store.set_keystone(book["id"], 3, ((0.1, 0.1), (0.9, 0.12), (0.88, 0.9), (0.1, 0.92)))
     store.save_analysis(book["id"], infos, (opts.max_angle, opts.dpi))
     store.close()
 
@@ -465,6 +519,9 @@ def test_store_roundtrip():
             and store.flagged_pages(book["id"], "cleanup") == {0}, "逐页的开关应原样恢复")
     f.check(store.box_adjusts(book["id"]) == {2: (-0.02, 0, 0, 0.01)}, "版心微调应原样恢复")
     f.check(store.box_adjusts(book["id"], "box_align") == {2: (-0.02, 0, 0, 0)}, "「版心居中」那一刻的红框应原样恢复")
+    f.check(store.keystones(book["id"]) == {3: ((0.1, 0.1), (0.9, 0.12), (0.88, 0.9), (0.1, 0.92))}, "梯形校正应原样恢复")
+    store.set_keystone(book["id"], 3, None)
+    f.check(store.keystones(book["id"]) == {}, "取消校正后应清掉")
     restored = store.load_analysis(book, (opts.max_angle, opts.dpi))
     same = lambda a, b: (a is None and b is None) or np.allclose(np.array(a, float).ravel(), np.array(b, float).ravel())
     f.check(restored is not None and len(restored) == len(infos), "分析结果应能取回")
@@ -497,7 +554,7 @@ def test_store_migrates_old_schema():
     db.close()
     store = Store(path)
     columns = {r["name"] for r in store.db.execute("PRAGMA table_info(pages)")}
-    f.check({"deleted", "cleanup", "box_adjust", "box_align"} <= columns, f"旧数据库应自动补上新增的列，实际 {sorted(columns)}")
+    f.check({"deleted", "cleanup", "box_adjust", "box_align", "keystone"} <= columns, f"旧数据库应自动补上新增的列，实际 {sorted(columns)}")
     f.check(store.flagged_pages(1, "skip") == {2}, "旧数据应保留")
     store.set_page_flag(1, 0, "cleanup", True)
     f.check(store.flagged_pages(1, "cleanup") == {0}, "升级后新的列应可以读写")

@@ -13,6 +13,7 @@
               有的扫描软件这样存黑白页；对它做色彩空间转换会报 source colorspace must not be None
     wide.pdf  6 页。第 2、4 页的倾斜超出默认的 ±5° 检测范围；第 3、5 页由上下两张图拼成，
               取不了内嵌原图、只能渲染
+    trap.pdf  3 页：第 2 页的文字块被拉成了梯形（透视变形），其余两页正常
     cover.pdf 彩色封面 2 页（第 1 页画面铺满整页，第 2 页带白边）+ mask.pdf 的 8 页黑白文字页
     manga.pdf 漫画 6 页（灰度 JPEG）：分格、排线、实心黑块。第 1～4 页靠订口一侧有一道渐变的灰影
               （奇数页在右、偶数页在左，约 40 级），第 5、6 页纸面均匀
@@ -152,6 +153,18 @@ def build_manga(path):
     _save([make_manga_page(rng, side, angle=0.6 if k == 2 else 0.0) for k, side in enumerate(sides)], path, 85)
 
 
+TRAP_QUAD = ((260, 340), (980, 300), (1060, 1500), (160, 1440))    # trap.pdf 第 2 页文字块的四个角（像素）
+
+
+def build_trap(path):
+    rng = random.Random(7)
+    pages = [make_page(rng, 28, 0.0, 0, 0, False) for _ in range(3)]
+    src = np.float32([[220, 300], [1020, 300], [1020, 1480], [220, 1480]])
+    m = cv2.getPerspectiveTransform(src, np.float32(TRAP_QUAD))
+    pages[1] = cv2.warpPerspective(pages[1], m, (W, H), borderValue=PAPER)
+    _save(pages, path, 90)
+
+
 def make_cover(full):
     """彩色封面：渐变的底色（浅，不算深色内容）、大标题、一块插画。full=False 时四周留白边。"""
     yy, xx = np.mgrid[0:H, 0:W]
@@ -178,7 +191,7 @@ def build_cover(path):
 
 
 BUILDERS = {"h.pdf": build_horizontal, "v.pdf": build_vertical, "mask.pdf": build_mask, "wide.pdf": build_wide,
-            "manga.pdf": build_manga, "cover.pdf": build_cover}
+            "manga.pdf": build_manga, "cover.pdf": build_cover, "trap.pdf": build_trap}
 
 
 def build_all(directory):

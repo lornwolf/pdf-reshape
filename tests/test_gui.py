@@ -443,6 +443,72 @@ def drag(d):
     d.check(len(after.find_withtag("handle")) == 8, "处理结束后小方块应恢复")
 
 
+def keystone(d):
+    """梯形校正：按钮在「梯形校正 / 执行校正」之间切换；四个角在左侧可拖；执行后铺满整页；取消校正恢复原样；随书保存。"""
+    app = d.app
+    before = app.canvases[0]
+    d.open(fixtures()["trap.pdf"])
+    d.check(str(app.btn_keystone.cget("state")) == "disabled", "分析完之前「梯形校正」不可用")
+    yield d.idle
+    d.goto(2)
+    yield d.previewed
+    d.check(str(app.btn_keystone.cget("state")) == "normal" and not app.btn_keystone_cancel.winfo_manager(),
+            "分析完之后「梯形校正」可用，没校正过的页没有「取消校正」")
+    old_status = d.status()
+    d.click(app.btn_keystone)
+    d.check(app.btn_keystone.cget("text") == "执行校正" and app.keystone_edit is not None and app.keystone_edit[0] == 1,
+            "按下后应进入编辑、按钮改名为「执行校正」")
+    d.check(bool(app.btn_keystone_cancel.winfo_manager()), "编辑中应有「取消校正」")
+    yield d.previewed
+    d.check(len(before.find_withtag("quad_handle")) == 4, f"左侧应画出四边形和 4 个角，实际 {len(before.find_withtag('quad_handle'))}")
+    d.check("梯形校正" in d.status(), f"右侧应显示校正后的结果，实际: {d.status()}")
+    quad0 = [list(p) for p in app.keystone_edit[1]]
+    x0, y0, dw, dh = app.preview_geometry[0]
+    hx, hy = (round(v) for v in app.quad_points()[0])          # 拖左上角
+    before.event_generate("<ButtonPress-1>", x=hx, y=hy)
+    before.event_generate("<B1-Motion>", x=hx - 10, y=hy - 8)
+    before.event_generate("<ButtonRelease-1>", x=hx - 10, y=hy - 8)
+    app.update()
+    moved = app.keystone_edit[1][0]
+    d.check(abs(moved[0] - (quad0[0][0] - 10 / dw)) < 0.002 and abs(moved[1] - (quad0[0][1] - 8 / dh)) < 0.002
+            and app.keystone_edit[1][1:] == quad0[1:], f"拖左上角应只动左上角，实际 {app.keystone_edit[1]}")
+    d.click(app.btn_keystone_cancel)                            # 编辑中的「取消校正」：放弃编辑
+    d.check(app.keystone_edit is None and app.btn_keystone.cget("text") == "梯形校正" and 1 not in app.keystone,
+            "编辑中点「取消校正」应放弃编辑")
+    d.click(app.btn_keystone)                                   # 重新进入编辑（自动的四边形），直接执行
+    d.click(app.btn_keystone)
+    d.check(app.btn_keystone.cget("text") == "梯形校正" and app.keystone_edit is None and 1 in app.keystone,
+            "执行后按钮应改回「梯形校正」，校正记在这一页上")
+    d.check(bool(app.btn_keystone_cancel.winfo_manager()), "校正过的页应有「取消校正」")
+    d.check(app.store.keystones(app.book["id"]).get(1) == app.keystone[1], "梯形校正应保存进数据库")
+    d.check("梯形校正 1 页: 2" in app.lbl_skipped.cget("text"), f"标记列表应列出梯形校正的页，实际 {app.lbl_skipped.cget('text')}")
+    yield d.previewed
+    d.check(not before.find_withtag("quad") and app.preview_data[2] is None, "执行后左侧的四边形消失，右侧没有红框")
+    d.goto(1)
+    yield d.previewed
+    d.check(not app.btn_keystone_cancel.winfo_manager() and app.btn_keystone.cget("text") == "梯形校正", "别的页没有「取消校正」")
+    d.click(app.btn_keystone)                                   # 进入编辑再翻页：放弃编辑
+    d.goto(2)
+    yield d.previewed
+    d.check(app.keystone_edit is None and 0 not in app.keystone, "翻页应放弃没执行的编辑")
+
+    out = d.process_to("gui_keystone_out.pdf")
+    yield d.processed
+    m = measure(out)[1]
+    d.check(m["left"] < 0.05 and m["right"] < 0.05 and abs(m["angle"]) < 0.3, f"输出的第 2 页应铺满整页、行大致是平的（自动的四个角不如手调的准），实际 {m}")
+    d.check("梯形校正" in d.log(), "处理日志里应写明梯形校正")
+
+    d.open(fixtures()["trap.pdf"])                              # 重新打开：恢复
+    d.goto(2)
+    yield d.previewed
+    d.check(1 in app.keystone and bool(app.btn_keystone_cancel.winfo_manager()), "重新打开应恢复梯形校正")
+    d.click(app.btn_keystone_cancel)
+    d.check(1 not in app.keystone and not app.btn_keystone_cancel.winfo_manager(), "「取消校正」应清掉这一页的校正")
+    yield d.previewed
+    d.check(d.status() == old_status, f"取消后应恢复原样，实际: {d.status()}")
+    d.check(app.store.keystones(app.book["id"]) == {}, "取消应写进数据库")
+
+
 def files(d):
     """每本书的设置互不沿用；有记录的书恢复它自己的设置；改名的文件按内容认得；旧的默认输出名自动更新。"""
     app = d.app
@@ -595,6 +661,7 @@ SCENARIOS = [
     ("enhance", enhance, "gui_enhance.db", True, None),
     ("lock", lock, "gui_lock.db", True, None),
     ("drag", drag, "gui_drag.db", True, None),
+    ("keystone", keystone, "gui_keystone.db", True, None),
     ("files", files, "gui_files.db", True, None),
     ("book", book, "gui_book.db", True, None),
     ("stale_analysis", stale_analysis, "gui_stale.db", True, prepare_stale),

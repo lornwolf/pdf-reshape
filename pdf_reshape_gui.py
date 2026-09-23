@@ -70,6 +70,9 @@ class App(tk.Tk):
         self.deleted = set()               # 用户指定「删除当前页」的页：新 PDF 中不输出
         self.adjust = {}                   # 用户对版心边框的手动微调 {页序: (左, 上, 右, 下 的移动量)}
         self.cleanup = set()               # 用户指定「去除边缘污染」的页
+        self.keystone = {}                 # 梯形校正 {页序: 四个角 ((x, y) × 4)}；见 core.keystone_of
+        self.keystone_edit = None          # 正在编辑的梯形校正：(页序, [[x, y] × 4])，None = 没在编辑
+        self.keystone_drag = None          # 正拖着四边形的第几个角
         self.align = {}                    # 用户点「版心居中」那一刻的 adjust：对齐按它算（见 core.align_box）
         self.estimate_gen = 0              # 输出大小预估的请求序号（丢弃过期结果用）
         self.estimate_key = None           # 上次预估时的全部相关设置；没变就不重算
@@ -154,7 +157,7 @@ class App(tk.Tk):
         for name, text, var in [("deskew", "倾斜校正", self.var_deskew),
                                 ("center", "版心居中", self.var_center),
                                 ("per_page", "每页各自居中\n（不参照全书标准版心）", self.var_per_page),
-                                ("clean_margin", "版心外涂成纸色\n（去黑边、阴影）", self.var_clean),
+                                ("clean_margin", "版心外去污染\n（只对黑白页；去掉版心外的黑边、污渍）", self.var_clean),
                                 ("upscale", "黑白页旋转时 2 倍分辨率\n（笔画更平滑，体积变大）", self.var_upscale),
                                 ("enhance", "显示增强\n（只增强能明显改善的页）", self.var_enhance),
                                 ("flatten", "纸面找平\n（纸色拉白，去掉页边的灰影）", self.var_flatten)]:
@@ -244,35 +247,52 @@ class App(tk.Tk):
         # ---- 第二行：手动微调当前页的版心边框（预览里的红框）
         edge_bar = ttk.Frame(right)
         edge_bar.pack(fill="x", pady=(4, 0))
-        ttk.Label(edge_bar, text="版心边框").pack(side="left")
+        # 相关的按钮各成一组，用边框框起来（用户要求）：箭头 + 复位、与前后页相同、去污 + 梯形校正
+        group = lambda: ttk.Frame(edge_bar, relief="groove", borderwidth=1, padding=(3, 2))
+        nudge_group = group()
+        nudge_group.pack(side="left")
+        ttk.Label(nudge_group, text="版心边框").pack(side="left", padx=(2, 0))
         self.var_edge = tk.StringVar(value="上")
-        edge_box = ttk.Combobox(edge_bar, textvariable=self.var_edge, values=list(EDGES), width=4, state="readonly")
-        edge_box.pack(side="left", padx=(6, 10))
+        edge_box = ttk.Combobox(nudge_group, textvariable=self.var_edge, values=list(EDGES), width=4, state="readonly")
+        edge_box.pack(side="left", padx=(6, 8))
         edge_box.bind("<<ComboboxSelected>>", lambda e: self.update_nudge_buttons())
         self.nudge_buttons = {}
-        # 按钮上画三角形：↑↓ 这两个字符会被 Windows 固定换成彩色的表情符号，和 ←→ 不一致
+        # 按钮上画三角形：↑↓ 这两个字符会被 Windows 固定换成彩色的表情符号，和 ←→ 不一致。
+        # 和别的按钮同样的样式（ttk），符号居中；按住不放连续调靠自己计时（ttk 没有 repeatdelay）
         glyphs = {"↑": "▲", "↓": "▼", "←": "◀", "→": "▶"}
         for arrow, delta in (("↑", -1), ("↓", 1), ("←", -1), ("→", 1)):
-            # tk.Button 而不是 ttk：按住不放可以连续调（repeatdelay / repeatinterval）
-            btn = tk.Button(edge_bar, text=glyphs[arrow], width=3, relief="groove", state="disabled",
-                            repeatdelay=400, repeatinterval=80, command=lambda d=delta: self.nudge(d))
+            btn = ttk.Button(nudge_group, text=glyphs[arrow], width=3, state="disabled",
+                             command=lambda d=delta: self.nudge(d))
             btn.pack(side="left", padx=1)
+            btn.bind("<ButtonPress-1>", lambda e, d=delta: self.start_repeat(e.widget, d))
+            btn.bind("<ButtonRelease-1>", lambda e: self.stop_repeat())
             self.nudge_buttons[arrow] = btn
-        self.btn_nudge_reset = ttk.Button(edge_bar, text="复位", width=5, command=self.reset_nudge, state="disabled")
-        self.btn_nudge_reset.pack(side="left", padx=(10, 2))
+        self.repeat_after_id = None        # 按住箭头连续调的计时器
+        self.repeated = False              # 这次按住期间已经连续调过（松手时不再算一次点击）
+        self.btn_nudge_reset = ttk.Button(nudge_group, text="复位", width=5, command=self.reset_nudge, state="disabled")
+        self.btn_nudge_reset.pack(side="left", padx=(8, 2))
         # 调红框本身不移动页面；点这个按钮才按现在的红框重新对齐。「复位」把两者一起撤销
         self.btn_center = ttk.Button(edge_bar, text="版心居中", width=9, command=self.center_by_box, state="disabled")
-        self.btn_center.pack(side="left", padx=(2, 6))
+        self.btn_center.pack(side="left", padx=(6, 6))
         # 红框照邻页的来：当前页的红框判断得不好、邻页的好时用。结果记成手动微调，可以再调、可以复位
-        self.btn_like_prev = ttk.Button(edge_bar, text="与前页相同", state="disabled",
+        like_group = group()
+        like_group.pack(side="left")
+        self.btn_like_prev = ttk.Button(like_group, text="与前页相同", state="disabled",
                                         command=lambda: self.copy_neighbor_box(-1))
-        self.btn_like_prev.pack(side="left", padx=(6, 2))
-        self.btn_like_next = ttk.Button(edge_bar, text="与后页相同", state="disabled",
+        self.btn_like_prev.pack(side="left", padx=(2, 2))
+        self.btn_like_next = ttk.Button(like_group, text="与后页相同", state="disabled",
                                         command=lambda: self.copy_neighbor_box(1))
-        self.btn_like_next.pack(side="left", padx=2)
-        # 去除边缘污染：把红框外疑似墨迹的地方按周围干净的纸面重新画上。逐页的开关
-        self.btn_cleanup = ttk.Button(edge_bar, text="去除边缘污染", state="disabled", command=self.toggle_cleanup)
-        self.btn_cleanup.pack(side="left", padx=(12, 6))
+        self.btn_like_next.pack(side="left", padx=(2, 2))
+        # 去除边缘污染：把红框外疑似墨迹的地方按周围干净的纸面重新画上。逐页的开关。
+        # 梯形校正：按下后在「处理前」一侧画出红色四边形（自动判断的版心，四个角可拖），按钮变成
+        # 「执行校正」；再按就把四边形围成的区域铺满整页。校正过的页旁边多一个「取消校正」
+        fix_group = group()
+        fix_group.pack(side="left", padx=(6, 0))
+        self.btn_cleanup = ttk.Button(fix_group, text="去除边缘污染", state="disabled", command=self.toggle_cleanup)
+        self.btn_cleanup.pack(side="left", padx=(2, 6))
+        self.btn_keystone = ttk.Button(fix_group, text="梯形校正", command=self.toggle_keystone, state="disabled")
+        self.btn_keystone.pack(side="left", padx=(2, 2))
+        self.btn_keystone_cancel = ttk.Button(fix_group, text="取消校正", command=self.cancel_keystone)
         self.lbl_nudge = ttk.Label(edge_bar, text="", foreground="#666")
         self.lbl_nudge.pack(side="left", padx=4)
 
@@ -466,10 +486,12 @@ class App(tk.Tk):
         self.adjust = self.store.box_adjusts(book["id"])
         self.align = self.store.box_adjusts(book["id"], "box_align")
         self.cleanup = self.store.flagged_pages(book["id"], "cleanup")
+        self.keystone = self.store.keystones(book["id"])
 
     def update_skip_label(self):
         parts = []
-        for title, marked in (("不修正", self.skipped), ("删除", self.deleted), ("去污", self.cleanup)):
+        for title, marked in (("不修正", self.skipped), ("删除", self.deleted), ("去污", self.cleanup),
+                              ("梯形校正", self.keystone)):
             if marked:
                 pages = sorted(i + 1 for i in marked)
                 shown = ", ".join(map(str, pages[:6])) + (" …" if len(pages) > 6 else "")
@@ -494,6 +516,7 @@ class App(tk.Tk):
             self.ref["adjust"] = self.adjust
             self.ref["align"] = self.align
             self.ref["cleanup"] = self.cleanup
+            self.ref["keystone"] = self.keystone
 
     def neighbor_index(self, direction):
         """前（-1）/后（+1）方向上最近的一个有版心、没被删除的页；没有就返回 None。"""
@@ -527,6 +550,87 @@ class App(tk.Tk):
         return (not self.locked and self.ref is not None
                 and self.analysis_key == self.current_key(self.get_options()))
 
+    # ------------------------------------------------------------ 梯形校正
+
+    def update_keystone_buttons(self):
+        index = self.current_index()
+        editing = self.keystone_edit is not None and self.keystone_edit[0] == index
+        usable = self.adjust_ready() and bool(self.infos) and index < len(self.infos)   # 原样复制的页（封面）也能校正
+        self.btn_keystone.configure(text="执行校正" if editing else "梯形校正", state="normal" if usable else "disabled")
+        if usable and (editing or index in self.keystone):
+            self.btn_keystone_cancel.configure(text="取消校正")
+            if not self.btn_keystone_cancel.winfo_manager():
+                self.btn_keystone_cancel.pack(side="left", padx=(2, 2), after=self.btn_keystone)
+        else:
+            self.btn_keystone_cancel.pack_forget()
+
+    def toggle_keystone(self):
+        """「梯形校正」→ 进入编辑（画出自动判断的四边形）；「执行校正」→ 按现在的四边形校正这一页。"""
+        if not self.adjust_ready() or not self.page_count:
+            return
+        index = self.current_index()
+        if self.keystone_edit is not None and self.keystone_edit[0] == index:
+            quad = tuple((round(x, 5), round(y, 5)) for x, y in self.keystone_edit[1])
+            self.keystone_edit = None
+            self.keystone[index] = quad
+            if self.store and self.book:
+                self.store.set_keystone(self.book["id"], index, quad)
+            self.update_keystone_buttons()
+            self.update_skip_label()
+            self.hold_estimate()
+            self.schedule_preview()
+            return
+        quad = self.keystone.get(index)
+        if quad is None:                    # 初值：墨迹凸包近似成的四边形（扫成梯形的页就是版心的四个角）
+            info = self.infos[index]
+            try:
+                with fitz.open(self.var_input.get()) as doc:
+                    img = core.load_page_image(doc, doc[info.index], info, self.get_options().dpi)
+                quad = core.suggest_keystone(img, info.scan_rect)
+            except Exception as e:
+                self.write_log(f"梯形校正：无法判断版心（{e}），请手动拖四个角")
+                quad = ((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95))
+        self.keystone_edit = (index, [list(p) for p in quad])
+        self.update_nudge_buttons()         # 按钮改名，提示语换成拖角的说明
+        self.schedule_preview()
+
+    def cancel_keystone(self):
+        """编辑中：放弃编辑；已校正的页：取消校正，恢复原样。"""
+        index = self.current_index()
+        if self.keystone_edit is not None:
+            self.keystone_edit = None
+        elif index in self.keystone:
+            del self.keystone[index]
+            if self.store and self.book:
+                self.store.set_keystone(self.book["id"], index, None)
+            self.update_skip_label()
+            self.hold_estimate()
+        self.update_keystone_buttons()
+        self.schedule_preview()
+
+    def quad_points(self):
+        """编辑中的四边形的四个角在「处理前」画布上的位置 [(x, y), ...]。"""
+        x0, y0, dw, dh = self.preview_geometry[0]
+        return [(x0 + px * dw, y0 + py * dh) for px, py in self.keystone_edit[1]]
+
+    def draw_quad(self):
+        cv = self.canvases[0]
+        cv.delete("quad")
+        if self.keystone_edit is None or not self.preview_geometry[0] or self.keystone_edit[0] != self.preview_index:
+            return
+        pts = self.quad_points()
+        cv.create_polygon(*[c for p in pts for c in p], outline="#e03131", fill="", width=2, tags="quad")
+        for hx, hy in pts:
+            cv.create_rectangle(hx - HANDLE_HALF - 1, hy - HANDLE_HALF - 1, hx + HANDLE_HALF + 1, hy + HANDLE_HALF + 1,
+                                fill="white", outline="#e03131", tags=("quad", "quad_handle"))
+
+    def quad_corner_at(self, x, y):
+        if self.keystone_edit is None or not self.preview_geometry[0] or self.keystone_edit[0] != self.preview_index:
+            return None
+        near = [(max(abs(x - hx), abs(y - hy)), k) for k, (hx, hy) in enumerate(self.quad_points())]
+        reach, corner = min(near)
+        return corner if reach <= HANDLE_REACH + 2 else None
+
     def update_nudge_buttons(self):
         """选「上/下」时只有上下箭头可用，选「左/右」时只有左右箭头可用；全书分析完之前都不可用。"""
         ready = self.adjust_ready()
@@ -542,6 +646,7 @@ class App(tk.Tk):
             state="normal" if has_box and self.neighbor_index(1) is not None else "disabled")
         self.btn_cleanup.configure(state="normal" if has_box else "disabled",
                                    text="取消去除污染" if index in self.cleanup else "去除边缘污染")
+        self.update_keystone_buttons()
         offsets, aligned = self.adjust.get(index), self.align.get(index)
         self.btn_nudge_reset.configure(state="normal" if ready and (offsets or aligned) else "disabled")
         pending = offsets != aligned         # 红框和上次「版心居中」时的不一样：页面还没有按现在的红框对齐
@@ -550,7 +655,30 @@ class App(tk.Tk):
         text = "本页已微调: " + "  ".join(parts) if parts else ""
         if pending:
             text += ("  " if text else "红框已复原  ") + "（点「版心居中」按现在的红框对齐）"
+        if self.keystone_edit is not None and self.keystone_edit[0] == index:
+            text = "拖左侧四边形的四个角围住版心，再点「执行校正」"
         self.lbl_nudge.configure(text=text)
+
+    def start_repeat(self, button, direction):
+        """按住箭头不放：0.4 秒后开始每 0.08 秒调一步。松手时第一次的那一步由按钮本身的 command 来做。"""
+        if str(button.cget("state")) == "disabled":
+            return
+        self.stop_repeat()
+        self.repeated = False
+
+        def tick():
+            self.repeated = True
+            self.nudge(direction)
+            self.repeat_after_id = self.after(80, tick)
+        self.repeat_after_id = self.after(400, tick)
+
+    def stop_repeat(self):
+        if self.repeat_after_id:
+            self.after_cancel(self.repeat_after_id)
+            self.repeat_after_id = None
+        if self.repeated:                   # 已经连续调过了：松手不再算一次点击（拦下 ttk 按钮自己的 command）
+            self.repeated = False
+            return "break"
 
     def nudge(self, direction):
         """把选中的那条边移动一步。direction: -1 向上/向左，+1 向下/向右。"""
@@ -715,7 +843,8 @@ class App(tk.Tk):
             return
         key = (self.analysis_key, opts.deskew, opts.center, opts.per_page, opts.clean_margin, opts.upscale, opts.enhance,
                opts.flatten, opts.min_angle, opts.quality, frozenset(self.skipped), frozenset(self.deleted), tuple(indices),
-               tuple(sorted(self.adjust.items())), tuple(sorted(self.align.items())), frozenset(self.cleanup))
+               tuple(sorted(self.adjust.items())), tuple(sorted(self.align.items())), frozenset(self.cleanup),
+               tuple(sorted(self.keystone.items())))
         if key == self.estimate_key or not indices:
             return
         self.estimate_key = key
@@ -800,6 +929,8 @@ class App(tk.Tk):
         self.adjust = {}
         self.align = {}
         self.cleanup = set()
+        self.keystone = {}
+        self.keystone_edit = None
         self.btn_delete.configure(state="normal")
         self.lbl_total.configure(text=f"/ {self.page_count}")
         self.btn_run.configure(state="normal")
@@ -929,7 +1060,8 @@ class App(tk.Tk):
         infos = [self.infos[i] for i in indices]
         self.save_state()
         # 标准版心和挂在上面的逐页设定交副本：处理线程一页一页地读它们，不能和界面共用
-        ref = dict(self.ref, adjust=dict(self.adjust), align=dict(self.align), cleanup=frozenset(self.cleanup))
+        ref = dict(self.ref, adjust=dict(self.adjust), align=dict(self.align), cleanup=frozenset(self.cleanup),
+                   keystone=dict(self.keystone))
         self.start_worker(self._process_thread, self.var_input.get(), infos, ref, opts, out, whole,
                           frozenset(self.skipped), frozenset(self.deleted))
 
@@ -1011,6 +1143,12 @@ class App(tk.Tk):
         analyzed = self.analysis_key == self.current_key(opts)
         info = self.infos[index] if analyzed else None
         ref = self.ref if analyzed else None
+        if self.keystone_edit is not None and self.keystone_edit[0] != index:
+            self.keystone_edit = None                       # 翻页就放弃没执行的编辑
+            self.update_keystone_buttons()
+        if self.keystone_edit is not None and ref is not None:
+            # 编辑中：右侧按正在编辑的四边形显示校正结果（交给线程的是副本）
+            ref = dict(ref, keystone={**self.keystone, index: tuple(tuple(p) for p in self.keystone_edit[1])})
         skip = index in self.skipped
         deleted = index in self.deleted
         self.update_skip_button(skip)
@@ -1068,6 +1206,8 @@ class App(tk.Tk):
                 cv.create_line(x0, y0 + dh / 2, x0 + dw, y0 + dh / 2, fill="#2a7fff", dash=(4, 4))
                 if slot == 1 and box:
                     self.draw_box(box)
+            if slot == 0:
+                self.draw_quad()
             if slot == 1 and deleted:       # 已删除的页：在「处理后」一侧打上红叉
                 cv.create_line(x0, y0, x0 + dw, y0 + dh, fill="#d00000", width=4)
                 cv.create_line(x0 + dw, y0, x0, y0 + dh, fill="#d00000", width=4)
@@ -1121,13 +1261,23 @@ class App(tk.Tk):
             pass
 
     def on_canvas_press(self, slot, x, y):
-        handle = self.handle_at(x, y) if slot == 1 else None
+        if slot == 0:                                       # 「处理前」一侧：编辑梯形校正时可以拖四个角
+            corner = self.quad_corner_at(x, y)
+            if corner is None:
+                return self.show_loupe(slot, x, y)
+            self.keystone_drag = corner
+            return
+        handle = self.handle_at(x, y)
         if handle is None:
             return self.show_loupe(slot, x, y)
         self.drag = (handle, x, y, self.preview_data[2])
         self.drag_box = self.preview_data[2]
 
     def on_canvas_motion(self, slot, x, y):
+        if slot == 0 and self.keystone_drag is not None:
+            x0, y0, dw, dh = self.preview_geometry[0]
+            self.keystone_edit[1][self.keystone_drag] = [min(max((x - x0) / dw, 0.0), 1.0), min(max((y - y0) / dh, 0.0), 1.0)]
+            return self.draw_quad()
         if not self.drag:
             return self.show_loupe(slot, x, y)
         (xi, yi), px, py, start = self.drag
@@ -1145,6 +1295,9 @@ class App(tk.Tk):
         self.draw_box(self.drag_box)
 
     def on_canvas_release(self, slot):
+        if slot == 0 and self.keystone_drag is not None:
+            self.keystone_drag = None
+            return self.schedule_preview()                  # 右侧按新的四边形重新校正
         if not self.drag:
             return self.hide_loupe()
         (xi, yi), _px, _py, start = self.drag

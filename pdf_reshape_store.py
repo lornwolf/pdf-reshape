@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS pages (
     cleanup     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「去除边缘污染」
     box_adjust  TEXT,                        -- 用户对版心四条边的手动微调 [左, 上, 右, 下]（JSON），没调过为 NULL
     box_align   TEXT,                        -- 用户点「版心居中」那一刻的 box_adjust：对齐按它算，没点过为 NULL
+    keystone    TEXT,                        -- 梯形校正的四个角 [[x, y] × 4]（左上、右上、右下、左下，按原图归一化，JSON），没做过为 NULL
     analysis    TEXT,                        -- 这一页的分析结果（PageInfo 的 JSON）
     PRIMARY KEY (book_id, page_index)
 );
@@ -106,6 +107,8 @@ class Store:
             self.db.execute("ALTER TABLE pages ADD COLUMN box_align TEXT")
             # 没有这一列的版本里，调了红框就自动按它对齐：照搬过来，升级后这些页的输出才不会变
             self.db.execute("UPDATE pages SET box_align = box_adjust")
+        if "keystone" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN keystone TEXT")
 
     def close(self):
         self.db.close()
@@ -191,23 +194,41 @@ class Store:
         return {r["page_index"] for r in rows}
 
     BOX_COLUMNS = ("box_adjust", "box_align")      # 红框的手动微调、点「版心居中」那一刻的红框，格式相同
+    JSON_COLUMNS = BOX_COLUMNS + ("keystone",)     # pages 表里存 JSON 的逐页设定
+
+    def set_page_json(self, book_id, page_index, column, value):
+        """保存某一页的一项 JSON 设定；value 为 None 表示清掉。"""
+        assert column in self.JSON_COLUMNS
+        self.db.execute(f"""
+            INSERT INTO pages (book_id, page_index, {column}) VALUES (?, ?, ?)
+            ON CONFLICT (book_id, page_index) DO UPDATE SET {column} = excluded.{column}""",
+                        (book_id, page_index, json.dumps(value) if value is not None else None))
+        self.db.execute("UPDATE books SET updated_at = ? WHERE id = ?", (_now(), book_id))
+        self.db.commit()
+
+    def page_jsons(self, book_id, column):
+        assert column in self.JSON_COLUMNS
+        rows = self.db.execute(
+            f"SELECT page_index, {column} AS value FROM pages WHERE book_id = ? AND {column} IS NOT NULL", (book_id,))
+        return {r["page_index"]: json.loads(r["value"]) for r in rows}
 
     def set_box_adjust(self, book_id, page_index, offsets, column="box_adjust"):
         """保存某一页版心的手动微调；offsets 为 None 或全 0 表示复位。"""
         assert column in self.BOX_COLUMNS
-        value = json.dumps([round(o, 5) for o in offsets]) if offsets and any(offsets) else None
-        self.db.execute(f"""
-            INSERT INTO pages (book_id, page_index, {column}) VALUES (?, ?, ?)
-            ON CONFLICT (book_id, page_index) DO UPDATE SET {column} = excluded.{column}""",
-                        (book_id, page_index, value))
-        self.db.execute("UPDATE books SET updated_at = ? WHERE id = ?", (_now(), book_id))
-        self.db.commit()
+        self.set_page_json(book_id, page_index, column,
+                           [round(o, 5) for o in offsets] if offsets and any(offsets) else None)
 
     def box_adjusts(self, book_id, column="box_adjust"):
-        assert column in self.BOX_COLUMNS
-        rows = self.db.execute(
-            f"SELECT page_index, {column} AS box FROM pages WHERE book_id = ? AND {column} IS NOT NULL", (book_id,))
-        return {r["page_index"]: tuple(json.loads(r["box"])) for r in rows}
+        return {index: tuple(value) for index, value in self.page_jsons(book_id, column).items()}
+
+    def set_keystone(self, book_id, page_index, quad):
+        """保存某一页梯形校正的四个角（[[x, y] × 4]，归一化）；None 表示取消校正。"""
+        self.set_page_json(book_id, page_index, "keystone",
+                           [[round(float(x), 5), round(float(y), 5)] for x, y in quad] if quad else None)
+
+    def keystones(self, book_id):
+        return {index: tuple((float(x), float(y)) for x, y in value)
+                for index, value in self.page_jsons(book_id, "keystone").items()}
 
     def save_analysis(self, book_id, infos, params):
         """保存全书的分析结果。用户的手动调整（skip）原样保留。"""

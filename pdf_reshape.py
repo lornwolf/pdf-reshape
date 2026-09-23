@@ -6,7 +6,7 @@
     python pdf_reshape.py input.pdf                 # 输出 input（校正版）.pdf
     python pdf_reshape.py input.pdf -o out.pdf
     python pdf_reshape.py input.pdf --pages 1-20    # 只处理部分页（试效果用）
-    python pdf_reshape.py input.pdf --clean-margin  # 顺便把版心外的黑边/阴影涂成纸色
+    python pdf_reshape.py input.pdf --clean-margin  # 顺便把黑白页版心外的黑边、污渍去掉
 
 处理分两遍:
     第 1 遍  分析每页的倾斜角度和版心位置，统计全书的标准版心尺寸
@@ -64,7 +64,7 @@ class PageInfo:
 BOOK_TYPES = {"text": "文字书", "manga": "漫画书"}
 # 各类书在界面上显示、在处理中生效的「修正内容」选项。不在列表里的选项对这类书一律视为关闭（Options.effective）
 BOOK_OPTIONS = {"text": ("deskew", "center", "per_page", "clean_margin", "upscale", "enhance"),
-                "manga": ("deskew", "center", "per_page", "clean_margin", "flatten")}
+                "manga": ("deskew", "center", "per_page", "flatten")}
 
 
 @dataclass
@@ -73,7 +73,7 @@ class Options:
     deskew: bool = True         # 倾斜校正
     center: bool = True         # 版心居中
     per_page: bool = False      # 每页各自居中（不参照全书标准版心）
-    clean_margin: bool = False  # 把版心以外涂成纸色
+    clean_margin: bool = False  # 版心外去污染（文字书）：全书的黑白页都去掉版心外的黑边、污渍，同「去除边缘污染」
     upscale: bool = False       # 黑白二值页旋转时以 2 倍分辨率输出（笔画边缘更平滑，体积约 2.7 倍）
     enhance: bool = False       # 显示增强：对能有明显改善的黑白页，自动选合适的方法增强显示效果
     flatten: bool = False       # 纸面找平（漫画）：把灰度/彩色页的纸面按当地纸色拉白，页边的灰影就没了
@@ -576,6 +576,62 @@ def align_box(info, ref):
     return page_box(info, ref, "align")
 
 
+def keystone_of(info, ref):
+    """用户对这一页指定的梯形校正：四个角 ((x, y) × 4：左上、右上、右下、左下，按原图归一化)，没有为 None。
+    和手动微调一样挂在 ref 上（ref["keystone"]）。校正后这四个角围成的区域铺满整页，这一页不再旋转、平移。
+    「原样复制」的页（铺满整页的封面、空白页）也可以校正：封面同样会扫成梯形；这类页取不了内嵌原图时按渲染 DPI 渲染。"""
+    if ref:
+        return ref.get("keystone", {}).get(info.index)
+    return None
+
+
+def suggest_keystone(img, scan_rect=(0.0, 0.0, 1.0, 1.0)):
+    """给梯形校正提一个初值：把墨迹的凸包近似成四边形。扫成梯形的页，版心的四个角就是这四个点；
+    近似不成四边形（内容形状怪）就退回版心的外接矩形。返回 ((x, y) × 4)，归一化。"""
+    gray = to_gray(img)
+    scale = ANALYSIS_LONG_SIDE / max(gray.shape)
+    small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else gray
+    ink = make_ink_mask(small, scan_rect)
+    h, w = ink.shape
+    pts = cv2.findNonZero(ink)
+    if pts is None or len(pts) < 50:
+        return ((0.05, 0.05), (0.95, 0.05), (0.95, 0.95), (0.05, 0.95))
+    hull = cv2.convexHull(pts)
+    quad = None
+    for eps in np.linspace(0.005, 0.1, 20):                     # 逐步放宽，直到近似成四个点
+        approx = cv2.approxPolyDP(hull, eps * cv2.arcLength(hull, True), True)
+        if len(approx) == 4:
+            quad = approx.reshape(4, 2).astype(float)
+            break
+        if len(approx) < 4:
+            break
+    if quad is None:
+        x, y, bw, bh = cv2.boundingRect(pts)
+        quad = np.array([[x, y], [x + bw, y], [x + bw, y + bh], [x, y + bh]], float)
+    return order_quad([(px / w, py / h) for px, py in quad])
+
+
+def order_quad(points):
+    """把四个点排成左上、右上、右下、左下。"""
+    pts = sorted(points, key=lambda p: p[0] + p[1])            # x+y 最小的是左上、最大的是右下
+    tl, br = pts[0], pts[-1]
+    rest = sorted(pts[1:3], key=lambda p: p[0] - p[1])         # x-y 大的是右上
+    bl, tr = rest[0], rest[1]
+    return (tuple(tl), tuple(tr), tuple(br), tuple(bl))
+
+
+def keystone_image(img, quad, scale=1, nearest=False):
+    """梯形校正：把 quad 围成的区域用透视变换铺满整页（大小不变，scale > 1 时同时放大）。"""
+    h, w = img.shape[:2]
+    src = np.array([[x * w, y * h] for x, y in quad], np.float32)
+    dst = np.array([[0, 0], [w * scale, 0], [w * scale, h * scale], [0, h * scale]], np.float32)
+    m = cv2.getPerspectiveTransform(src, dst)
+    bg = np.median(img[::8, ::8].reshape(-1, 1 if img.ndim == 2 else 3), axis=0)
+    return cv2.warpPerspective(img, m, (w * scale, h * scale),
+                               flags=cv2.INTER_NEAREST if nearest else cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(float(v) for v in bg))
+
+
 def cleanup_box(info, ref):
     """用户对这一页指定了「去除边缘污染」时，返回它的红框（对齐用的版心），否则返回 None。
 
@@ -774,6 +830,12 @@ def flatten_paper(img):
     return np.clip(img.astype(np.float32) * gain + 0.5, 0, 255).astype(np.uint8)
 
 
+def margin_clean_of(info, opts, skip=False):
+    """这一页要不要做全局的「版心外去污染」：选项开着、是黑白二值页（用户定的：灰度/彩色页不动）、
+    用户没有指定「本页不修正」（不修正的页只接受逐页指定的去污）。"""
+    return bool(opts.clean_margin and info.bilevel and not skip and info.mode != "copy")
+
+
 def flatten_of(info, opts, skip=False):
     """这一页要不要做纸面找平：选项开着、是灰度/彩色页、用户没有指定「本页不修正」。
 
@@ -837,21 +899,14 @@ def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, c
         interp = cv2.INTER_NEAREST
     out = cv2.warpAffine(img, m, (w, h), flags=interp,
                          borderMode=cv2.BORDER_CONSTANT, borderValue=bg)
-    if clean_margin:
-        pad = 0.02
-        bbox = bbox or info.bbox            # 传进来的是全部内容的范围（content_box）：含外挂的页码，不含杂质
-        x0 = max(int((bbox[0] + shift[0] - pad) * w), 0)
-        y0 = max(int((bbox[1] + shift[1] - pad) * h), 0)
-        x1 = min(int((bbox[2] + shift[0] + pad) * w), w)
-        y1 = min(int((bbox[3] + shift[1] + pad) * h), h)
-        mask = np.ones((h, w), dtype=bool)
-        mask[y0:y1, x0:x1] = False
-        out[mask] = bg if img.ndim == 3 else bg[0]
-    if cleanup:                                 # cleanup 是这一页的红框（cleanup_box），去掉它外面的污染
-        pad = 0.004
-        rect = (max(int((cleanup[0] + shift[0] - pad) * w), 0), max(int((cleanup[1] + shift[1] - pad) * h), 0),
-                min(int((cleanup[2] + shift[0] + pad) * w), w), min(int((cleanup[3] + shift[1] + pad) * h), h))
-        out = remove_margin_stains(out, rect, info.bilevel)
+    # 版心外去污染：全局的按全部内容的范围（content_box：含外挂的页码，不含杂质），逐页的按红框（cleanup_box）。
+    # 两者做的事一样（remove_margin_stains）；全局的曾经是把版心外整块涂成中位色，灰度页上会留下一道平色带
+    for box in ((bbox or info.bbox) if clean_margin else None, cleanup):
+        if box:
+            pad = 0.004
+            rect = (max(int((box[0] + shift[0] - pad) * w), 0), max(int((box[1] + shift[1] - pad) * h), 0),
+                    min(int((box[2] + shift[0] + pad) * w), w), min(int((box[3] + shift[1] + pad) * h), h))
+            out = remove_margin_stains(out, rect, info.bilevel)
     return out
 
 
@@ -1038,13 +1093,23 @@ def render_page(doc, info, ref, opts, angle, shift, skip=False):
     source = load_page_image(doc, doc[info.index], info, opts.dpi)
     if flat:                                        # 先找平再变换：旋转补的边就是白的
         source = flatten_paper(source)
-    # 不修正的页不受全局的「版心外涂成纸色」影响；它只接受用户逐页指定的去污
+    quad = keystone_of(info, ref)
+    if quad:
+        # 梯形校正：四个角围成的区域铺满整页，旋转、平移、去污都不再有意义（版心外的东西已经在页面之外）
+        if angle == 0.0 and grow == 1:
+            scale = 1                       # 不旋转的页「2 倍分辨率」不起作用，和 transform_image 一致
+        img = keystone_image(source, quad, scale)
+        if method:
+            plain = keystone_image(source, quad, scale, nearest=True) if scale > 1 else None
+            img = enhance_bitmap(img, method, scale, info.dpi, plain)
+        return img, method
+    clean = margin_clean_of(info, opts, skip)
     kwargs = dict(scale=scale, bbox=content_box(info, ref), cleanup=cleanup_box(info, ref), keep_scale=grow > 1)
-    img = transform_image(source, info, angle, shift, opts.clean_margin and not skip, **kwargs)
+    img = transform_image(source, info, angle, shift, clean, **kwargs)
     if method:
         plain = None
         if scale > 1:
-            plain = transform_image(source, info, angle, shift, opts.clean_margin and not skip, nearest=True, **kwargs)
+            plain = transform_image(source, info, angle, shift, clean, nearest=True, **kwargs)
         img = enhance_bitmap(img, method, scale, info.dpi, plain)
     return img, method
 
@@ -1361,6 +1426,10 @@ def plan_page(info, ref, opts, skip=False):
     「不修正」管的是位置，不挡「去除边缘污染」：封面、插图页这类不想让程序挪动的页恰恰常有黑边。
     同时指定了去污的页不能原样复制，而是位置不动（像素原样搬运）、只去污。
     """
+    if keystone_of(info, ref):
+        # 梯形校正是用户明确指定的：优先于「本页不修正」；校正后版心铺满整页，不再旋转、平移
+        method = enhancement_of(info, opts)
+        return 0.0, (0.0, 0.0), False, "梯形校正（版心铺满整页）" + (f"  显示增强: {describe_enhancement(method)}" if method else "")
     if skip:
         if cleanup_box(info, ref) is not None:
             return 0.0, (0.0, 0.0), False, "本页不修正（手动指定）  去除边缘污染"
@@ -1379,12 +1448,13 @@ def plan_page(info, ref, opts, skip=False):
     cleanup = cleanup_box(info, ref) is not None
     method = enhancement_of(info, opts)
     flat = flatten_of(info, opts)
-    untouched = info.mode == "copy" or (trivial and not opts.clean_margin and not cleanup and not method and not flat)
+    clean = margin_clean_of(info, opts)
+    untouched = info.mode == "copy" or (trivial and not clean and not cleanup and not method and not flat)
     if untouched:
         status = info.note or "无需修正"
     else:
         status = (f"旋转 {angle:+.2f}°  平移 x{shift[0] * 100:+.1f}% y{shift[1] * 100:+.1f}%"
-                  + ("  去除边缘污染" if cleanup else "")
+                  + ("  去除边缘污染" if cleanup else "  版心外去污染" if clean else "")
                   + (f"  显示增强: {describe_enhancement(method)}" if method else "")
                   + (f"  纸面找平（灰影 {info.shade:.0f} 级）" if flat else "")
                   + (f"  ({info.note})" if info.note else ""))
@@ -1486,8 +1556,9 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
     groups = {}
     for item in work:
         skip = item[0].index in skip_pages
-        groups.setdefault((item[1] == 0.0, enhancement_of(item[0], opts, skip), flatten_of(item[0], opts, skip)),
-                          []).append(item)
+        # 梯形校正的页和旋转的页一样要完整地重采样，归到「旋转」那一组
+        groups.setdefault((item[1] == 0.0 and not keystone_of(item[0], ref), enhancement_of(item[0], opts, skip),
+                           flatten_of(item[0], opts, skip)), []).append(item)
     for group in groups.values():
         n = min(len(group), max(3, round(samples * len(group) / len(work))))
         step = len(group) / n
@@ -1498,9 +1569,9 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
                 raise Cancelled
             info, angle, shift, src = group[j]
             skip = info.index in skip_pages
-            key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4), opts.clean_margin,
+            key = (info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4), margin_clean_of(info, opts, skip),
                    opts.upscale, None if info.bilevel else opts.quality, opts.dpi, cleanup_box(info, ref),
-                   enhancement_of(info, opts, skip), flatten_of(info, opts, skip), skip)
+                   enhancement_of(info, opts, skip), flatten_of(info, opts, skip), skip, keystone_of(info, ref))
             if key not in cache:                    # 缓存一页单独存成 PDF 的字节，多次预估之间复用
                 single = fitz.open()
                 img, method = render_page(doc, info, ref, opts, angle, shift, skip=skip)
@@ -1561,7 +1632,8 @@ def preview_page(doc, info, ref, opts, skip=False):
         elif info.bilevel:                  # 预览也按实际输出那样二值化
             after = cv2.threshold(to_gray(after), 127, 255, cv2.THRESH_BINARY)[1]
     box = None
-    if info.bbox:       # 不动的页（不修正、无需修正）也画出红框：去污是按红框算的，得让用户先看到它
+    if info.bbox and not keystone_of(info, ref):   # 梯形校正过的页版心就是整页，没有红框可调
+        # 不动的页（不修正、无需修正）也画出红框：去污是按红框算的，得让用户先看到它
         b = page_box(info, ref)
         box = (b[0] + shift[0], b[1] + shift[1], b[2] + shift[0], b[3] + shift[1])
     return before, after, box, status
@@ -1599,7 +1671,8 @@ def main():
     ap.add_argument("--no-center", action="store_true", help="不做版心居中")
     ap.add_argument("--per-page", action="store_true",
                     help="每页各自居中（默认会参照全书标准版心，避免半页内容跑到页面中间）")
-    ap.add_argument("--clean-margin", action="store_true", help="把版心以外涂成纸色（去黑边、阴影）")
+    ap.add_argument("--clean-margin", action="store_true",
+                    help="版心外去污染（文字书）：全书的黑白页都去掉版心外的黑边、污渍，同 --cleanup-pages；灰度/彩色页不动")
     ap.add_argument("--enhance", action="store_true",
                     help="显示增强：对能有明显改善的黑白页，自动选合适的方法（平滑放大、去噪点、矢量化）")
     ap.add_argument("--upscale", action="store_true",
