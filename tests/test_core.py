@@ -44,7 +44,10 @@ def page_array(path, index, dpi=50):
 
 def test_horizontal():
     f = Failures()
-    out, infos, _ = process("h.pdf", "core_h_out.pdf")
+    doc, infos, opts = analyzed(fixtures()["h.pdf"])
+    ref = pr.compute_reference(infos)
+    out = work_path("core_h_out.pdf")
+    pr.process_document(doc, infos, opts, out, ref=ref)
     from make_test import HORIZONTAL
     for info, spec in zip(infos, HORIZONTAL):
         f.close(info.angle, -spec[1], 0.11, f"第 {info.index + 1} 页检测到的倾斜")
@@ -53,11 +56,15 @@ def test_horizontal():
     for i, m in enumerate(pages, 1):
         f.close(m["angle"], 0, 0.11, f"第 {i} 页的残余倾斜")
         f.close(m["left"], m["right"], 0.02, f"第 {i} 页左右边距")
-        if i != 6:
-            f.close(m["top"], m["bottom"], 0.01, f"第 {i} 页上下边距")
-    # 第 6 页是章末半页：上边要和别的页对齐，不能被垂直居中到页面中间
-    f.close(pages[5]["top"], pages[2]["top"], 0.01, "半页的上边距应与整页一致")
-    f.check(pages[5]["bottom"] > 0.5, "半页的下边距应该很大（没有被垂直居中）")
+        f.close(m["top"], m["bottom"], 0.01, f"第 {i} 页上下边距")      # 文字书一律居中，章末半页（第 6 页）也是
+    # 第 6 页是章末半页：默认也居中（用户要求统一居中）；要贴上边由用户按「版心：靠上」，等价于指定平移量
+    ref["shift"] = {5: (0.0, ref["boxes"][2][1] - ref["boxes"][5][1] + (1 - ref["ext"][1]) / 2 - ref["boxes"][2][1])}
+    out2 = work_path("core_h_top_out.pdf")
+    pr.process_document(doc, infos, opts, out2, ref=ref)
+    pages2 = measure(out2)
+    f.close(pages2[5]["top"], pages2[2]["top"], 0.01, "「靠上」后半页的上边距应与整页一致")
+    f.check(pages2[5]["bottom"] > 0.5, "「靠上」后半页的下边距应该很大")
+    f.check(5 in pr.notable_pages(infos, ref) and 2 not in pr.notable_pages(infos, ref), "半页应被标为「明显偏窄/偏矮」，整页不标")
     return f
 
 
@@ -114,7 +121,7 @@ def test_skip_delete_cleanup():
                             skip_pages={3}, delete_pages={1})
     pages = measure(out)
     f.check(len(pages) == 7, f"删除 1 页后应输出 7 页，实际 {len(pages)}")
-    f.close(abs(pages[2]["angle"]), 3.8, 0.11, "不修正的页（原第 4 页）应保持原来的倾斜")
+    f.close(abs(pages[2]["angle"]), 3.8, 0.11, "不纠偏居中的页（原第 4 页）应保持原来的倾斜")
     f.close(pages[1]["angle"], 0, 0.11, "其余页照常纠偏")
     cleaned, untouched_edge = page_array(out, 0), page_array(out, 5)      # 原第 1 页去污；原第 7 页有黑边但没去污
     f.check(cleaned[:8].min() > 200 and cleaned[:, :8].min() > 200, "去除边缘污染后，页边不应再有黑边")
@@ -124,15 +131,15 @@ def test_skip_delete_cleanup():
 
 
 def test_clean_margin_only_touches_bilevel_pages():
-    """「版心外去污染」：黑白页版心外的黑边去掉；灰度页不动（用户定的）；不修正的页不受影响。"""
+    """「版心外去污染」：黑白页版心外的黑边去掉；灰度页不动（用户定的）；不纠偏居中的页不受影响。"""
     f = Failures()
     doc, infos, _ = analyzed(fixtures()["mask.pdf"])
     out = work_path("core_clean_mask_out.pdf")
     pr.process_document(doc, infos, pr.Options(clean_margin=True), out, skip_pages={6})
     cleaned = page_array(out, 0)                                # 第 1 页带黑边的黑白页
     f.check(cleaned[:8].min() > 200 and cleaned[:, :8].min() > 200, "黑白页版心外的黑边应被去掉")
-    kept = page_array(out, 6)                                   # 第 7 页也带黑边，但指定了不修正
-    f.check(min(kept[:8].min(), kept[:, :8].min()) < 100, "不修正的页不受全局去污的影响")
+    kept = page_array(out, 6)                                   # 第 7 页也带黑边，但指定了不纠偏居中
+    f.check(min(kept[:8].min(), kept[:, :8].min()) < 100, "不纠偏居中的页不受全局去污的影响")
     f.check(not pr.margin_clean_of(infos[0], pr.Options(book="manga", clean_margin=True).effective()), "漫画没有这一项")
     doc, infos, _ = analyzed(fixtures()["h.pdf"])
     out = work_path("core_clean_gray_out.pdf")
@@ -143,19 +150,43 @@ def test_clean_margin_only_touches_bilevel_pages():
     return f
 
 
+def test_clean_margin_covers_gray_stored_mono_pages():
+    """存成 8bit、实际上是黑白的页（白纸、抗锯齿的文字）也算黑白页：版心外去污染对它生效。"""
+    f = Failures()
+    from make_test import make_page
+    import random
+    page = make_page(random.Random(9), 20, 0.4, 10, 0, True)
+    page = np.where(page >= 200, 255, page).astype(np.uint8)   # 纸是纯白，只剩文字边缘的几级灰
+    path = work_path("core_mono.pdf")
+    doc = fitz.open()
+    pg = doc.new_page(width=595, height=842)
+    pg.insert_image(pg.rect, stream=cv2.imencode(".png", page)[1].tobytes(), keep_proportion=False)
+    doc.save(path)
+    doc = fitz.open(path)
+    infos = pr.analyze_document(doc, range(1), pr.Options())
+    f.check(not infos[0].bilevel and infos[0].mono, f"8bit 存的黑白页应判为 mono，实际 bilevel={infos[0].bilevel} mono={infos[0].mono}")
+    gray = pr.analyze_document(fitz.open(fixtures()["h.pdf"]), range(1), pr.Options())[0]
+    f.check(not gray.mono, "灰纸的灰度扫描页不算 mono")
+    out = work_path("core_mono_out.pdf")
+    pr.process_document(doc, infos, pr.Options(clean_margin=True), out)
+    cleaned = page_array(out, 0)
+    f.check(cleaned[:8].min() > 200 and cleaned[:, :8].min() > 200, "mono 页版心外的黑边应被去掉")
+    return f
+
+
 def test_skip_page_can_still_be_cleaned():
-    """「本页不修正」管的是位置，不挡「去除边缘污染」（曾经点了没反应）。"""
+    """「本页不纠偏居中」管的是位置，不挡「去除边缘污染」（曾经点了没反应）。"""
     f = Failures()
     out, infos, _ = process("h.pdf", "core_skip_cleanup_out.pdf", ref_extra={"cleanup": {3}}, skip_pages={3, 6})
     pages = measure(out)
-    f.close(abs(pages[3]["angle"]), 3.8, 0.11, "不修正 + 去污的页：位置和倾斜应保持不动")
+    f.close(abs(pages[3]["angle"]), 3.8, 0.11, "不纠偏居中 + 去污的页：位置和倾斜应保持不动")
     edge = page_array(out, 3)
-    f.check(edge[:8].min() > 200 and edge[:, :8].min() > 200, "不修正 + 去污的页：黑边应被去掉")
+    f.check(edge[:8].min() > 200 and edge[:, :8].min() > 200, "不纠偏居中 + 去污的页：黑边应被去掉")
     original, kept = page_array(fixtures()["h.pdf"], 3), page_array(out, 3)
     inside = (slice(60, -60), slice(60, -60))               # 版心里的内容应和原页一样（只差 JPEG 重存的细微误差）
     f.check(np.abs(original[inside].astype(int) - kept[inside].astype(int)).mean() < 2, "位置不动时内容应与原页一致")
-    other = page_array(out, 6)                              # 只是不修正、没指定去污的页：原样保留
-    f.check(min(other[:8].min(), other[:, :8].min(), other[-8:].min()) < 100, "只指定不修正的页应原样保留（黑边还在）")
+    other = page_array(out, 6)                              # 只是不纠偏居中、没指定去污的页：原样保留
+    f.check(min(other[:8].min(), other[:, :8].min(), other[-8:].min()) < 100, "只指定不纠偏居中的页应原样保留（黑边还在）")
     return f
 
 
@@ -180,14 +211,21 @@ def test_box_adjust_and_neighbor():
     f.close(pr.page_box(infos[2], ref)[0], 0.08, 1e-6, "手动微调后的左边")
     f.check(pr.page_box(infos[6], ref) == boxes[0], "微调只影响那一页")
 
-    # 调红框本身不移动页面；用户点了「版心居中」（ref["align"]）之后才按新的红框对齐
+    # 调红框本身不移动页面：默认的平移量按自动检测的版心居中算，不含微调
     plain = pr.compute_shift(infos[2], pr.compute_reference(infos), False)
-    f.check(pr.compute_shift(infos[2], ref, False) == plain, "只调了红框、没点「版心居中」时，平移量不应变")
-    ref["align"] = {2: (-0.02, 0.0, 0.0, 0.0)}
-    f.close(pr.compute_shift(infos[2], ref, False)[0], plain[0] + 0.01, 1e-6, "点了「版心居中」后应按新的红框对齐")
-    ref["adjust"] = {2: (-0.06, 0.0, 0.0, 0.0)}                               # 居中之后又调了红框：对齐仍按居中那一刻的
-    f.close(pr.compute_shift(infos[2], ref, False)[0], plain[0] + 0.01, 1e-6, "居中之后再调红框，平移量不应跟着变")
+    f.check(pr.compute_shift(infos[2], ref, False) == plain, "只调了红框，平移量不应变")
+    f.close(plain[0], (1 - 0.75) / 2 - 0.10, 1e-6, "文字书默认：自动版心居中")
+    # 用户按了「版心：…」或手动调整：平移量直接记在 ref["shift"] 里，之后再调红框也不变
+    ref["shift"] = {2: (0.03, -0.01)}
+    f.check(pr.compute_shift(infos[2], ref, False) == (0.03, -0.01), "指定过的平移量应原样使用")
+    ref["adjust"] = {2: (-0.06, 0.0, 0.0, 0.0)}
+    f.check(pr.compute_shift(infos[2], ref, False) == (0.03, -0.01), "指定之后再调红框，平移量不应跟着变")
     f.close(pr.page_box(infos[2], ref)[0], 0.04, 1e-6, "红框本身跟着最新的微调")
+    f.check(pr.standard_edges(ref) == ((1 - 0.75) / 2, (1 - 0.8) / 2, (1 + 0.75) / 2, (1 + 0.8) / 2), "「靠边」贴的是标准版心居中时的边")
+    # 漫画仍走全书的对齐规则（章末半页贴上边）；文字书一律居中
+    half = pr.PageInfo(index=9, mode="native", bbox=(0.10, 0.1, 0.85, 0.5))
+    f.close(pr.compute_shift(half, ref, False, "manga")[1], 0.0, 1e-6, "漫画：半页贴齐上边")
+    f.close(pr.compute_shift(half, ref, False, "text")[1], (1 - 0.4) / 2 - 0.1, 1e-6, "文字书：半页也居中")
     return f
 
 
@@ -223,8 +261,7 @@ def test_axis_shift_rules():
     f = Failures()
     edges = [(0.10, 0.85), (0.17, 0.92)]                   # 本页所属的一类、另一类
     f.close(pr.axis_shift(0.20, 0.95, 0.75, edges, True), -0.075, 1e-6, "整页：单独居中")
-    f.close(pr.axis_shift(0.15, 0.85, 0.75, edges, True), 0.025, 1e-6, "左侧缩进、右缘对齐：贴齐右边")
-    f.close(pr.axis_shift(0.22, 0.92, 0.75, edges, True), -0.045, 1e-6, "页序的奇偶反了：按另一类贴齐")
+    f.close(pr.axis_shift(0.15, 0.85, 0.75, edges, True), (1 - 0.7) / 2 - 0.15, 1e-6, "略窄的页：居中（「一侧缩进」的规则已删）")
     f.close(pr.axis_shift(0.125, 0.825, 0.75, edges, True), (1 - 0.7) / 2 - 0.125, 1e-6, "两边缩得差不多：居中")
     f.close(pr.axis_shift(0.10, 0.40, 0.80, [(0.10, 0.90)] * 2, False), 0.0, 1e-6, "章末半页：贴齐上边")
     return f
@@ -340,7 +377,7 @@ def test_enhance_output():
     image = result[0].get_images(full=True)[0]
     f.check((image[2], image[3], image[4]) == (3720, 5262, 1), f"增强的页应是 3 倍分辨率的 1bit 图，实际 {image[2:5]}")
     image = result[1].get_images(full=True)[0]
-    f.check((image[2], image[3]) == (1240, 1754), "「本页不修正」的页不应被增强")
+    f.check((image[2], image[3]) == (1240, 1754), "「本页不纠偏居中」的页不应被增强")
     for i, m in enumerate(measure(out), 1):
         if i != 2:
             f.close(m["angle"], 0, 0.11, f"第 {i} 页的残余倾斜")
@@ -356,6 +393,62 @@ def test_enhance_output():
 
 # ---------------------------------------------------------------- 建议值与大小预估
 
+def test_super_resolution():
+    """高清化：黑白页以 4 倍分辨率二值化输出，灰度页缩回 2 倍；大小预估不跑 AI；程序在的话真的跑一次。"""
+    f = Failures()
+    calls = []
+    original = pr.super_resolve
+
+    ticks = []
+
+    def stub(img, progress=None, **kwargs):                     # 用三次插值冒充 AI 放大，只测接线
+        calls.append(img.shape)
+        if progress:
+            progress(0.5)
+            progress(1.0)
+        return cv2.resize(img, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    pr.super_resolve = stub
+    pr.SR_CACHE.clear()
+    try:
+        doc, infos, opts = analyzed(fixtures()["mask.pdf"])
+        ref = pr.compute_reference(infos)
+        ref["sr"] = {1}
+        f.check("高清化" in pr.plan_page(infos[1], ref, opts)[3] and not pr.plan_page(infos[1], ref, opts)[2], "指定了高清化的页应重新输出")
+        f.check(not pr.plan_page(infos[1], ref, opts, skip=True)[2], "不纠偏居中的页指定了高清化也要输出（位置不动）")
+        estimate = pr.estimate_output_size(doc, infos, ref, opts)[0]
+        f.check(not calls and estimate > 0, "大小预估不应跑 AI 放大")
+        out = work_path("core_sr_mask_out.pdf")
+        pr.process_document(doc, infos, opts, out, ref=ref, progress=lambda k, n: ticks.append(k))
+        f.check(len(calls) == 1, f"处理时每个高清化的页应放大一次，实际 {len(calls)} 次")
+        f.check(1.5 in ticks and 2.0 in ticks, f"高清化的进度应报在这一页的格子里（1.5、2.0），实际 {ticks}")
+        image = fitz.open(out)[1].get_images(full=True)[0]
+        f.check((image[2], image[3], image[4]) == (4 * 1240, 4 * 1754, 1), f"黑白页应是 4 倍分辨率的 1bit 图，实际 {image[2:5]}")
+        f.close(measure(out)[1]["angle"], 0, 0.11, "高清化的页照常纠偏")
+        pr.process_document(doc, infos, opts, out, ref=ref)
+        f.check(len(calls) == 1, "同样的页再处理一次应直接用缓存")
+
+        doc, infos, opts = analyzed(fixtures()["h.pdf"])
+        ref = pr.compute_reference(infos)
+        ref["sr"] = {0}
+        out = work_path("core_sr_gray_out.pdf")
+        pr.process_document(doc, infos, opts, out, ref=ref)
+        image = fitz.open(out)[0].get_images(full=True)[0]
+        f.check((image[2], image[3]) == (2 * 1240, 2 * 1754) and image[4] == 8, f"灰度页应缩回 2 倍分辨率输出，实际 {image[2:5]}")
+    finally:
+        pr.super_resolve = original
+        pr.SR_CACHE.clear()
+    exe = pr.find_sr_exe()
+    if exe:                                                     # 程序在：拿一小块真的跑一次（几秒钟）
+        small = page_array(fixtures()["h.pdf"], 0, dpi=30)[:120, :120]
+        seen = []
+        big = pr.super_resolve(small, progress=seen.append)
+        f.check(big.shape[:2] == (480, 480), f"Real-ESRGAN 应放大 4 倍，实际 {big.shape}")
+        f.check(seen and seen[-1] == 1.0 and all(0 <= v <= 1 for v in seen), f"应报 0～1 的进度、最后是 1，实际 {seen[:3]}…{seen[-1:]}")
+    else:
+        print("      （没有找到 realesrgan-ncnn-vulkan，跳过真实的放大）")
+    return f
+
+
 def test_keystone():
     """梯形校正：自动提的四边形接近真实的四个角；按四个角校正后文字行拉平、铺满整页；数据库能保存。"""
     f = Failures()
@@ -370,7 +463,7 @@ def test_keystone():
     true_quad = tuple((x / W, y / H) for x, y in TRAP_QUAD)
     ref["keystone"] = {1: true_quad}
     f.check(pr.plan_page(infos[1], ref, opts)[3].startswith("梯形校正"), "有梯形校正的页状态应写明")
-    f.check(pr.plan_page(infos[1], ref, opts, skip=True)[2] is False, "梯形校正优先于「本页不修正」")
+    f.check(pr.plan_page(infos[1], ref, opts, skip=True)[2] is False, "梯形校正优先于「本页不纠偏居中」")
     doc2, infos2, _ = analyzed(fixtures()["cover.pdf"])         # 「原样复制」的页（铺满整页的封面）也能校正
     ref2 = pr.compute_reference(infos2)
     ref2["keystone"] = {0: ((0.02, 0.02), (0.98, 0.03), (0.97, 0.98), (0.03, 0.97))}
@@ -504,6 +597,8 @@ def test_store_roundtrip():
     store.set_box_adjust(book["id"], 2, (-0.02, 0, 0, 0.01))
     store.set_box_adjust(book["id"], 2, (-0.02, 0, 0, 0), column="box_align")
     store.set_keystone(book["id"], 3, ((0.1, 0.1), (0.9, 0.12), (0.88, 0.9), (0.1, 0.92)))
+    store.set_shift(book["id"], 4, (0.012, -0.03))
+    store.set_page_flag(book["id"], 4, "confirmed", True)
     store.save_analysis(book["id"], infos, (opts.max_angle, opts.dpi))
     store.close()
 
@@ -522,6 +617,11 @@ def test_store_roundtrip():
     f.check(store.keystones(book["id"]) == {3: ((0.1, 0.1), (0.9, 0.12), (0.88, 0.9), (0.1, 0.92))}, "梯形校正应原样恢复")
     store.set_keystone(book["id"], 3, None)
     f.check(store.keystones(book["id"]) == {}, "取消校正后应清掉")
+    f.check(store.shifts(book["id"]) == {4: (0.012, -0.03)} and store.flagged_pages(book["id"], "confirmed") == {4},
+            "指定的平移量和「确认完毕」应原样恢复")
+    store.set_setting("window", {"geometry": "1250x860+-1920+30", "zoomed": True})
+    f.check(store.get_setting("window") == {"geometry": "1250x860+-1920+30", "zoomed": True} and store.get_setting("nope") is None,
+            "程序设置（窗口位置）应能存取")
     restored = store.load_analysis(book, (opts.max_angle, opts.dpi))
     same = lambda a, b: (a is None and b is None) or np.allclose(np.array(a, float).ravel(), np.array(b, float).ravel())
     f.check(restored is not None and len(restored) == len(infos), "分析结果应能取回")
@@ -554,7 +654,7 @@ def test_store_migrates_old_schema():
     db.close()
     store = Store(path)
     columns = {r["name"] for r in store.db.execute("PRAGMA table_info(pages)")}
-    f.check({"deleted", "cleanup", "box_adjust", "box_align", "keystone"} <= columns, f"旧数据库应自动补上新增的列，实际 {sorted(columns)}")
+    f.check({"deleted", "cleanup", "box_adjust", "box_align", "keystone", "sr", "shift", "confirmed"} <= columns, f"旧数据库应自动补上新增的列，实际 {sorted(columns)}")
     f.check(store.flagged_pages(1, "skip") == {2}, "旧数据应保留")
     store.set_page_flag(1, 0, "cleanup", True)
     f.check(store.flagged_pages(1, "cleanup") == {0}, "升级后新的列应可以读写")

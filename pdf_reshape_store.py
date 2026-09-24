@@ -34,15 +34,22 @@ CREATE TABLE IF NOT EXISTS books (
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,                  -- 程序的设置（窗口位置等），不属于某本书
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS pages (
     book_id     INTEGER NOT NULL REFERENCES books(id) ON DELETE CASCADE,
     page_index  INTEGER NOT NULL,            -- 从 0 开始
-    skip        INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「本页不修正」
+    skip        INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「本页不纠偏居中」
     deleted     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「删除当前页」（新 PDF 中不输出）
     cleanup     INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「去除边缘污染」
+    sr          INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户指定「高清化」（Real-ESRGAN 放大）
     box_adjust  TEXT,                        -- 用户对版心四条边的手动微调 [左, 上, 右, 下]（JSON），没调过为 NULL
     box_align   TEXT,                        -- 用户点「版心居中」那一刻的 box_adjust：对齐按它算，没点过为 NULL
     keystone    TEXT,                        -- 梯形校正的四个角 [[x, y] × 4]（左上、右上、右下、左下，按原图归一化，JSON），没做过为 NULL
+    shift       TEXT,                        -- 用户指定的平移量 [dx, dy]（「版心：…」按钮、手动调整的结果，归一化，JSON），没指定为 NULL
+    confirmed   INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户点过「确认完毕」（版心明显偏窄的页，滚动条上不再标黄）
     analysis    TEXT,                        -- 这一页的分析结果（PageInfo 的 JSON）
     PRIMARY KEY (book_id, page_index)
 );
@@ -109,6 +116,12 @@ class Store:
             self.db.execute("UPDATE pages SET box_align = box_adjust")
         if "keystone" not in cols:
             self.db.execute("ALTER TABLE pages ADD COLUMN keystone TEXT")
+        if "sr" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN sr INTEGER NOT NULL DEFAULT 0")
+        if "shift" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN shift TEXT")
+        if "confirmed" not in cols:
+            self.db.execute("ALTER TABLE pages ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 0")
 
     def close(self):
         self.db.close()
@@ -177,7 +190,7 @@ class Store:
 
     # ------------------------------------------------------------ 页
 
-    PAGE_FLAGS = ("skip", "deleted", "cleanup")    # pages 表里用户逐页设置的开关
+    PAGE_FLAGS = ("skip", "deleted", "cleanup", "sr", "confirmed")    # pages 表里用户逐页设置的开关
 
     def set_page_flag(self, book_id, page_index, flag, value):
         assert flag in self.PAGE_FLAGS
@@ -194,7 +207,7 @@ class Store:
         return {r["page_index"] for r in rows}
 
     BOX_COLUMNS = ("box_adjust", "box_align")      # 红框的手动微调、点「版心居中」那一刻的红框，格式相同
-    JSON_COLUMNS = BOX_COLUMNS + ("keystone",)     # pages 表里存 JSON 的逐页设定
+    JSON_COLUMNS = BOX_COLUMNS + ("keystone", "shift")     # pages 表里存 JSON 的逐页设定（box_align 已不用，列留着）
 
     def set_page_json(self, book_id, page_index, column, value):
         """保存某一页的一项 JSON 设定；value 为 None 表示清掉。"""
@@ -225,6 +238,22 @@ class Store:
         """保存某一页梯形校正的四个角（[[x, y] × 4]，归一化）；None 表示取消校正。"""
         self.set_page_json(book_id, page_index, "keystone",
                            [[round(float(x), 5), round(float(y), 5)] for x, y in quad] if quad else None)
+
+    def get_setting(self, key, default=None):
+        row = self.db.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def set_setting(self, key, value):
+        self.db.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                        (key, json.dumps(value)))
+        self.db.commit()
+
+    def set_shift(self, book_id, page_index, shift):
+        """保存某一页用户指定的平移量 (dx, dy)；None 表示回到自动。"""
+        self.set_page_json(book_id, page_index, "shift", [round(float(v), 5) for v in shift] if shift else None)
+
+    def shifts(self, book_id):
+        return {index: (float(v[0]), float(v[1])) for index, v in self.page_jsons(book_id, "shift").items()}
 
     def keystones(self, book_id):
         return {index: tuple((float(x), float(y)) for x, y in value)

@@ -34,11 +34,14 @@ def basic(d):
     """打开 → 后台分析 → 预览 → 处理输出。"""
     d.open(fixtures()["h.pdf"], analyze=False)
     d.check(not d.busy() and d.app.btn_reanalyze.cget("text") == "分析全书", "打开文件后不应自动分析，等用户点「分析全书」")
+    d.check(str(d.app.btn_skip.cget("state")) == "disabled" and str(d.app.btn_delete.cget("state")) == "disabled",
+            "分析之前逐页的按钮（含「本页不纠偏居中」「删除当前页」）都不可用")
     d.check(d.app.var_output.get().endswith("h（校正版）.pdf"), "输出文件名默认是「原文件名（校正版）.pdf」")
     d.click(d.app.btn_reanalyze)
     d.check(d.busy(), "点「分析全书」后应在后台开始分析")
     yield d.idle
     d.check(d.app.btn_reanalyze.cget("text") == "重新分析", "分析过之后按钮应变成「重新分析」")
+    d.check(str(d.app.btn_skip.cget("state")) == "normal" and str(d.app.btn_delete.cget("state")) == "normal", "分析完之后逐页的按钮可用")
     d.goto(4)
     yield d.previewed
     d.check("旋转 -3.80°" in d.status(), f"第 4 页的状态应显示旋转 -3.80°，实际: {d.status()}")
@@ -73,23 +76,23 @@ def keys(d):
 
 
 def marks(d):
-    """逐页的手动设定：不修正、删除、去除边缘污染、微调版心、与前页相同；处理输出。"""
+    """逐页的手动设定：不纠偏居中、删除、去除边缘污染、微调版心、与前页相同；处理输出。"""
     app = d.app
     d.open(fixtures()["h.pdf"])
     yield d.idle
 
     d.goto(4)
     d.click(app.btn_skip)
-    d.check(app.btn_skip.cget("text") == "恢复本页修正" and app.skipped == {3}, "「本页不修正」按下后应改名并记下这一页")
-    d.click(app.btn_cleanup)                                    # 不修正的页也可以去污（曾经点了没反应）
+    d.check(app.btn_skip.cget("text") == "恢复纠偏居中" and app.skipped == {3}, "「本页不纠偏居中」按下后应改名并记下这一页")
+    d.click(app.btn_cleanup)                                    # 不纠偏居中的页也可以去污（曾经点了没反应）
     yield d.previewed
-    d.check("本页不修正" in d.status() and "去除边缘污染" in d.status(), f"状态栏应同时注明两者，实际: {d.status()}")
+    d.check("本页不纠偏居中" in d.status() and "去除边缘污染" in d.status(), f"状态栏应同时注明两者，实际: {d.status()}")
     before, after, box = app.preview_data[0], app.preview_data[1], app.preview_data[2]
-    d.check(before[:30, :30].min() < 60 and after[:30, :30].min() > 200, "不修正的页去污后，预览里黑边应消失")
-    d.check(box is not None, "不修正的页也应画出红框（去污是按红框算的）")
+    d.check(before[:30, :30].min() < 60 and after[:30, :30].min() > 200, "不纠偏居中的页去污后，预览里黑边应消失")
+    d.check(box is not None, "不纠偏居中的页也应画出红框（去污是按红框算的）")
     d.click(app.btn_cleanup)                                    # 取消，后面的检查照旧
     d.goto(5)
-    d.check(app.btn_skip.cget("text") == "本页不修正", "翻到别的页，按钮应回到那一页的状态")
+    d.check(app.btn_skip.cget("text") == "本页不纠偏居中", "翻到别的页，按钮应回到那一页的状态")
 
     d.goto(2)
     d.click(app.btn_delete)
@@ -119,20 +122,18 @@ def marks(d):
     d.check(app.adjust == {2: (-0.02, 0.0, 0.0, 0.0)}, f"左边框左移 10 步应为 -2%，实际 {app.adjust}")
     yield d.previewed
     d.check(d.status() == old_status, f"只调红框不应移动页面，状态应不变，实际: {d.status()}")
-    d.check("版心居中" in app.lbl_nudge.cget("text"), f"应提示还没有按新的红框居中，实际: {app.lbl_nudge.cget('text')}")
-    d.click(app.btn_center)                                     # 点了「版心居中」才按新的红框对齐
-    d.check(app.align == app.adjust and str(app.btn_center.cget("state")) == "disabled", "居中之后按钮不可用，直到红框再变")
+    d.click(app.align_buttons["center"])                        # 按「版心：居中」才按新的红框对齐
+    d.check(2 in app.shift, "居中之后应记下这一页的平移量")
     yield d.previewed
-    d.check("x-2.8%" in d.status(), f"「版心居中」后应重新计算对齐（x-3.8% → x-2.8%），实际: {d.status()}")
-    d.click(app.nudge_buttons["←"])                             # 居中之后再调红框：页面仍然不动，按钮重新可用
+    d.check("x-2.8%" in d.status(), f"「居中」后应按新的红框重新居中（x-3.8% → x-2.8%），实际: {d.status()}")
+    d.click(app.nudge_buttons["←"])                             # 居中之后再调红框：页面仍然不动
     yield d.previewed
-    d.check("x-2.8%" in d.status() and str(app.btn_center.cget("state")) == "normal", f"再调红框页面不应动，实际: {d.status()}")
+    d.check("x-2.8%" in d.status(), f"再调红框页面不应动，实际: {d.status()}")
     d.click(app.nudge_buttons["→"])
-    d.check(app.adjust == app.align, "调回去之后应和居中时的红框一致")
 
     d.goto(6)                                                   # 半页的红框照前页的来
     d.click(app.btn_like_prev)
-    d.click(app.btn_center)
+    d.click(app.align_buttons["center"])
     d.check(d.frame_after(5) == d.frame_after(4), f"「与前页相同」后红框应与前页一致: {d.frame_after(5)} / {d.frame_after(4)}")
     d.check("去污 1 页: 1" in app.lbl_skipped.cget("text") and "删除 1 页: 2" in app.lbl_skipped.cget("text"),
             f"标记列表不对: {app.lbl_skipped.cget('text')}")
@@ -141,7 +142,7 @@ def marks(d):
     yield d.processed
     pages = measure(out)
     d.check(len(pages) == 7, f"删除 1 页后应输出 7 页，实际 {len(pages)}")
-    d.failures.close(abs(pages[2]["angle"]), 3.8, 0.11, "不修正的页应保持原来的倾斜")
+    d.failures.close(abs(pages[2]["angle"]), 3.8, 0.11, "不纠偏居中的页应保持原来的倾斜")
     edge = page_array(out, 0)
     d.check(edge[:8].min() > 200 and edge[:, :8].min() > 200, "去污的页输出后不应再有黑边")
     d.check(any("删除 1 页" in m[2] for m in d.messages), "完成提示里应写明删除了几页")
@@ -154,13 +155,13 @@ def marks_restore(d):
     d.check(app.infos is not None and not d.busy(), "有保存的分析结果时应直接恢复，不重新分析")
     d.check(app.skipped == {3} and app.deleted == {1} and app.cleanup == {0} and set(app.adjust) == {2, 5},
             f"逐页设定没有恢复: {app.skipped} {app.deleted} {app.cleanup} {sorted(app.adjust)}")
-    d.check(app.align == app.adjust, f"「版心居中」的结果没有恢复: {app.align}")
+    d.check(set(app.shift) == {2, 5}, f"指定的平移量没有恢复: {app.shift}")
     d.check(bool(app.btn_reanalyze.winfo_manager()), "分析结果是从历史记录恢复的，应出现「重新分析」按钮")
     d.check(app.var_page.get() == 6, f"应回到上次看的页，实际第 {app.var_page.get()} 页")
     d.goto(3)
     d.click(app.btn_nudge_reset)
-    d.check(set(app.adjust) == {5} and set(app.align) == {5} and str(app.btn_nudge_reset.cget("state")) == "disabled",
-            "「复位」应同时撤销这一页的红框微调和手动居中")
+    d.check(set(app.adjust) == {5} and set(app.shift) == {5} and str(app.btn_nudge_reset.cget("state")) == "disabled",
+            "「复位」应同时撤销这一页的红框微调和指定的位置")
     yield d.previewed
     d.check("x-3.8%" in d.status(), f"复位后应回到自动判断的对齐（x-3.8%），实际: {d.status()}")
     d.goto(2)
@@ -363,7 +364,8 @@ def lock(d):
     d.check(editable() == ["disabled"] * 6, "打开另一本书、开始分析时应再次锁住")
     d.click(app.btn_cancel)
     yield lambda: not d.busy() and state(app.btn_cancel) == "disabled"
-    d.check(editable() == ["normal"] * 6 and state(app.btn_run) == "normal", f"取消分析之后应恢复，实际 {editable()}")
+    d.check(editable()[:4] == ["normal"] * 4 and editable()[4:] == ["disabled"] * 2 and state(app.btn_run) == "normal",
+            f"取消分析之后设置应恢复，逐页的按钮因为没有分析结果仍不可用，实际 {editable()}")
     app.var_max_angle.set(6.0)                                  # 分析参数变了：点「开始处理」会先重新分析，全程锁住
     d.process_to("gui_lock_out3.pdf")
     d.check(app.pending_run is not None and editable() == ["disabled"] * 6, "重新分析 + 处理的期间应锁住")
@@ -403,7 +405,7 @@ def drag(d):
     d.check(got is not None and abs(got[2] - 30 / dw) < 0.002 and not any((got[0], got[1], got[3])),
             f"拖右边中点应只把右边移动 {30 / dw:.4f}，实际 {got}")
     yield d.previewed
-    d.check("右" in app.lbl_nudge.cget("text"), f"拖动的结果应和箭头微调一样显示出来，实际: {app.lbl_nudge.cget('text')}")
+    d.check(str(app.btn_undo.cget("state")) == "normal", "拖动之后「撤销修正」应可用（提示行不再显示微调量）")
     d.check(app.store.box_adjusts(app.book["id"]).get(2) == got, "拖动的结果应保存进数据库")
 
     pull((0, 1), -20, -12)                                      # 左上角：左边和上边一起动，右边保持刚才的
@@ -441,6 +443,115 @@ def drag(d):
     yield d.processed
     yield d.previewed
     d.check(len(after.find_withtag("handle")) == 8, "处理结束后小方块应恢复")
+
+
+def sr(d):
+    """高清化：逐页开关，预览和输出走 AI 放大（这里用插值冒充），随书保存；程序不在时提示下载。"""
+    import cv2
+    core = d.core
+    app = d.app
+    calls = []
+    def fake_sr(img, progress=None, **k):
+        calls.append(1)
+        if progress:
+            progress(0.5)
+        return cv2.resize(img, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    core.super_resolve = fake_sr
+    real_find = core.find_sr_exe
+    core.find_sr_exe = lambda: None
+    d.open(fixtures()["mask.pdf"])
+    yield d.idle
+    d.goto(2)
+    yield d.previewed
+    d.click(app.btn_sr)
+    d.check(not app.sr and any(m[1] == "高清化" for m in d.messages), "程序不在时应提示下载、不打开开关")
+    core.find_sr_exe = lambda: "stub"
+    d.click(app.btn_sr)
+    d.check(app.sr == {1} and app.btn_sr.cget("text") == "取消高清化", "按下后这一页应标为高清化")
+    yield d.previewed
+    d.check(d.status().startswith("高清化完成") and calls, f"预览应经过 AI 放大、完成后有提示，实际: {d.status()}")
+    d.check("高清化 1 页: 2" in app.lbl_skipped.cget("text"), f"标记列表应列出高清化的页，实际 {app.lbl_skipped.cget('text')}")
+    d.check(app.store.flagged_pages(app.book["id"], "sr") == {1}, "应保存进数据库")
+    out = d.process_to("gui_sr_out.pdf")
+    yield d.processed
+    image = fitz.open(out)[1].get_images(full=True)[0]
+    d.check((image[2], image[3], image[4]) == (4 * 1240, 4 * 1754, 1), f"输出应是 4 倍分辨率的 1bit 图，实际 {image[2:5]}")
+    d.click(app.btn_sr)
+    d.check(app.sr == set() and app.btn_sr.cget("text") == "高清化", "再按一次取消")
+    core.find_sr_exe = real_find
+
+
+def align(d):
+    """版心的对齐：五个按钮、手动调整（方向键、鼠标拖）、边距标注、滚动条上的黄标和「确认完毕」；只给文字书。"""
+    app = d.app
+    after = app.canvases[1]
+    d.open(fixtures()["h.pdf"])
+    yield d.idle
+    d.check(5 in app.notable, f"章末半页（第 6 页）应标为值得看一眼的页，实际 {sorted(app.notable)}")
+    d.goto(3)
+    yield d.previewed
+    d.check(all(str(b.cget("state")) == "normal" for b in app.align_buttons.values()) and str(app.btn_manual.cget("state")) == "normal",
+            "分析完之后五个按钮和「手动调整」一直可用")
+    d.check(str(app.btn_confirm.cget("state")) == "disabled", "整页的「确认完毕」不可用")
+    d.check(len(after.find_withtag("margin")) == 8, f"应标注四条边到纸边的距离（4 条线 + 4 个数），实际 {len(after.find_withtag('margin'))}")
+    std = d.core.standard_edges(app.ref)
+    box = d.core.page_box(app.infos[2], app.ref)
+    d.click(app.align_buttons["left"])
+    d.failures.close(box[0] + app.shift[2][0], std[0], 1e-6, "「靠左」后红框左边应贴齐标准版心的左边")
+    d.click(app.align_buttons["bottom"])
+    d.failures.close(box[3] + app.shift[2][1], std[3], 1e-6, "「靠下」后红框下边应贴齐标准版心的下边")
+    d.failures.close(box[0] + app.shift[2][0], std[0], 1e-6, "「靠下」不应动水平方向")
+    d.click(app.align_buttons["center"])
+    d.failures.close((box[0] + box[2]) / 2 + app.shift[2][0], 0.5, 1e-6, "「居中」后水平居中")
+    d.failures.close((box[1] + box[3]) / 2 + app.shift[2][1], 0.5, 1e-6, "「居中」后竖直居中")
+    yield d.previewed
+
+    d.click(app.btn_manual)                                     # 手动调整：方向键
+    d.check(app.manual_move and app.btn_manual.cget("text") == "结束手动调整", "按下后进入手动调整")
+    before = app.shift[2]
+    d.press(after, "<Right>")
+    d.press(after, "<Down>")
+    d.check(abs(app.shift[2][0] - before[0] - d.gui.NUDGE_STEP) < 1e-9 and abs(app.shift[2][1] - before[1] - d.gui.NUDGE_STEP) < 1e-9,
+            f"方向键应移动版心一步，实际 {before} → {app.shift[2]}")
+    yield d.previewed
+    x0, y0, dw, dh = app.preview_geometry[1]                    # 鼠标拖：在页面上按住拖 20 像素
+    x, y = x0 + dw // 2, y0 + dh // 2
+    before = app.shift[2]
+    after.event_generate("<ButtonPress-1>", x=x, y=y)
+    after.event_generate("<B1-Motion>", x=x + 10, y=y + 5)
+    after.event_generate("<B1-Motion>", x=x + 20, y=y + 5)
+    after.event_generate("<ButtonRelease-1>", x=x + 20, y=y + 5)
+    app.update()
+    d.check(abs(app.shift[2][0] - before[0] - 20 / dw) < 0.002 and abs(app.shift[2][1] - before[1] - 5 / dh) < 0.002,
+            f"拖动应按像素移动版心，实际 {before} → {app.shift[2]}")
+    d.click(app.btn_manual)
+    d.check(not app.manual_move, "再按一次结束手动调整")
+    d.check(app.store.shifts(app.book["id"]).get(2) == app.shift[2], "平移量应保存进数据库")
+    d.click(app.btn_nudge_reset)
+    d.check(2 not in app.shift, "复位应清掉指定的平移量")
+
+    d.goto(6)                                                   # 黄标的页：确认完毕
+    yield d.previewed
+    d.check(str(app.btn_confirm.cget("state")) == "normal", "翻到黄标的页「确认完毕」可用")
+    marks = len(app.scroll.find_all())
+    d.click(app.align_buttons["top"])
+    d.click(app.btn_confirm)
+    d.check(5 in app.confirmed and str(app.btn_confirm.cget("state")) == "disabled" and len(app.scroll.find_all()) == marks - 1,
+            "确认后按钮变灰、滚动条上少一个黄标")
+    d.check(app.lbl_nudge.cget("text") == "", "提示行不显示「版心位置已指定」之类的文字")
+    d.check(app.store.flagged_pages(app.book["id"], "confirmed") == {5}, "确认应保存进数据库")
+    d.click(app.btn_undo)
+    d.check(5 not in app.confirmed and 5 not in app.shift and str(app.btn_confirm.cget("state")) == "normal"
+            and len(app.scroll.find_all()) == marks, "「撤销修正」应清掉指定的位置、退回未确认、黄标回来")
+    app.scroll_to(app.scroll.winfo_height() // 2)               # 拖滚动条翻页
+    d.check(app.var_page.get() in (4, 5), f"滚动条中点应翻到第 4～5 页，实际 {app.var_page.get()}")
+
+    app.var_book.set("manga")                                   # 漫画：这些都不显示
+    app.update()
+    d.check(not app.align_group.winfo_manager(), "漫画书不显示版心对齐那一组")
+    yield d.previewed
+    d.check(not after.find_withtag("margin"), "漫画书不标注边距")
+    app.var_book.set("text")
 
 
 def keystone(d):
@@ -662,6 +773,8 @@ SCENARIOS = [
     ("lock", lock, "gui_lock.db", True, None),
     ("drag", drag, "gui_drag.db", True, None),
     ("keystone", keystone, "gui_keystone.db", True, None),
+    ("align", align, "gui_align.db", True, None),
+    ("sr", sr, "gui_sr.db", True, None),
     ("files", files, "gui_files.db", True, None),
     ("book", book, "gui_book.db", True, None),
     ("stale_analysis", stale_analysis, "gui_stale.db", True, prepare_stale),

@@ -15,8 +15,12 @@
 import argparse
 import bisect
 import math
+import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +29,7 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-ANALYSIS_VERSION = 6        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
+ANALYSIS_VERSION = 9        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
 ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
 FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
 HANGING_TOLERANCE = 0.03    # 全部内容比标准的正文宽出这么多，才认为有东西（页码、页眉）挂在正文外面
@@ -33,6 +37,7 @@ OVERSIZE_TOLERANCE = 0.025  # 版心比标准版心大出这么多，才怀疑�
 EDGE_MATCH_TOLERANCE = 0.03  # 半页的版心边缘与同类页相差在此以内，才认为是同一条版心边
 FLUSH_RATIO = 0.35          # 略窄的页：一边离标准版心的距离不到另一边的这个比例，就认为这一边是对齐的、缩进全在另一边
 NARROW_TOLERANCE = 0.12     # 版心只比标准版心小这么多以内时，可以放心地单独居中（误差不超过它的一半）
+NOTABLE_SHORTFALL = 0.04    # 版心比标准版心窄（或矮）这么多以上的页，界面在滚动条上标黄，提醒用户看一眼
 FULL_BLEED_RATIO = 0.95     # 内容占满页面超过这个比例时，视为整页图片，不处理
 COLOR_CHROMA = 20           # 页面里彩度（RGB 三通道的最大差）超过这个值的像素占 5% 以上，才算彩色页
 PAPER_LIKE = 200            # 页边一圈里亮度至少这么高的像素才算纸；见 is_full_bleed_color
@@ -54,6 +59,7 @@ class PageInfo:
     enhance: str = ""           # 「显示增强」对这一页适合用的方法，空 = 增强了也没有明显改善；见 assess_enhancement
     shade: float = 0.0          # 灰度/彩色页：页边的纸色比中部暗多少级（订口阴影）；见 measure_shade
     full_bleed_color: bool = False  # 彩色、画面一直铺到页边的页（封面等）：文字书里原样保留；见 is_full_bleed_color
+    mono: bool = False          # 不是 1bit、但内容基本只有黑白两色的页（4bit/8bit 存的黑白页）；见 is_mono
     scan_rect: tuple = (0.0, 0.0, 1.0, 1.0)  # 扫描图在页面中的范围（归一化）
     # 以下两项每次 load_page_image 时重新填写，不依赖保存下来的分析结果
     jpeg_block: int = 0         # 原图是 JPEG 时，它的编码块大小（灰度 8、彩色 16）；不是 JPEG 为 0
@@ -63,7 +69,7 @@ class PageInfo:
 
 BOOK_TYPES = {"text": "文字书", "manga": "漫画书"}
 # 各类书在界面上显示、在处理中生效的「修正内容」选项。不在列表里的选项对这类书一律视为关闭（Options.effective）
-BOOK_OPTIONS = {"text": ("deskew", "center", "per_page", "clean_margin", "upscale", "enhance"),
+BOOK_OPTIONS = {"text": ("deskew", "center", "clean_margin", "upscale", "enhance"),      # 文字书本来就每页居中，没有「每页各自居中」
                 "manga": ("deskew", "center", "per_page", "flatten")}
 
 
@@ -354,6 +360,24 @@ def detect_content_bbox(ink):
 DENSE_RATIO = 0.08          # 覆盖某一列的文字行数不到全页行数的这个比例（至少要 3 行），这一列就不算正文
 
 
+def text_rows(ink):
+    """把页面按行投影切成一行一行的文字：[(起始行, 结束行), ...]。要竖排的「列」就传 ink.T。
+
+    哪些行属于文字行：墨迹要够多。只看「有没有墨迹」不行——页边只要有一道贯穿上下的细线或
+    一串污点，每一行就都「有墨迹」，整页连成一行。
+    """
+    amount = ink.sum(axis=1) / 255.0
+    if not amount.any():
+        return []
+    rows = np.flatnonzero(amount >= 0.15 * np.median(amount[amount > 0]))
+    if not len(rows):
+        return []
+    # 连续有墨迹的行归为一行文字；中间断 2 个像素以内的不算断（注音、标点会让行投影有细缝）
+    breaks = np.flatnonzero(np.diff(rows) > 3)
+    runs = [(rows[a], rows[b] + 1) for a, b in zip(np.r_[0, breaks + 1], np.r_[breaks, len(rows) - 1])]
+    return [(a, b) for a, b in runs if b - a >= 4]                  # 不到 4 个像素高的是噪点，不是一行字
+
+
 def dense_extent(ink):
     """求正文在水平方向上的范围（归一化），求不出来返回 None。要竖直方向的就传 ink.T。
 
@@ -365,18 +389,7 @@ def dense_extent(ink):
     只有两三个字，和页码分不开，硬用会让版心的下边随页忽上忽下。
     """
     h, w = ink.shape
-    # 哪些行属于文字行：墨迹要够多。只看「有没有墨迹」不行——页边只要有一道贯穿上下的细线或
-    # 一串污点，每一行就都「有墨迹」，整页连成一行
-    amount = ink.sum(axis=1) / 255.0
-    if not amount.any():
-        return None
-    rows = np.flatnonzero(amount >= 0.15 * np.median(amount[amount > 0]))
-    if not len(rows):
-        return None
-    # 连续有墨迹的行归为一行文字；中间断 2 个像素以内的不算断（注音、标点会让行投影有细缝）
-    breaks = np.flatnonzero(np.diff(rows) > 3)
-    runs = [(rows[a], rows[b] + 1) for a, b in zip(np.r_[0, breaks + 1], np.r_[breaks, len(rows) - 1])]
-    runs = [(a, b) for a, b in runs if b - a >= 4]                  # 不到 4 个像素高的是噪点，不是一行字
+    runs = text_rows(ink)
     if len(runs) < 4:                                               # 行数太少，「叠了很多行」无从谈起
         return None
     k = max(5, int(0.015 * w))                                      # 约一个字宽：抹平字与字之间的空隙
@@ -400,6 +413,18 @@ def dense_extent(ink):
     return float(lo / w), float(hi / w)
 
 
+MONO_MIDTONE_MAX = 0.08     # 中间调（64～191）的像素不到这个比例、纸又是白的，才算「实际上是黑白」的页
+
+
+def is_mono(gray):
+    """不是 1bit 却实际上是黑白的页：有的扫描件把黑白页存成 4bit/8bit（抗锯齿的边缘带几级灰）。
+    「版心外去污染」只对黑白页有效（用户定的），这种页也得算上——《契诃夫短篇小说选》239 页 1bit
+    之外有 8 页 4bit，勾了去污之后页边的扫描线还在（用户报的）。判断：纸是白的（90 百分位 ≥ 250），
+    中间调的像素不到 8%（第 7 页是 5%，都是文字边缘的抗锯齿；灰度照片、灰纸的扫描件远不止）。"""
+    hist = np.bincount(gray.ravel(), minlength=256)
+    return bool(np.percentile(gray, 90) >= 250 and hist[64:192].sum() < MONO_MIDTONE_MAX * gray.size)
+
+
 def is_full_bleed_color(img, scan_rect=(0.0, 0.0, 1.0, 1.0)):
     """彩色、而且画面一直铺到页边的页（彩色封面、整页彩图）。
 
@@ -407,7 +432,7 @@ def is_full_bleed_color(img, scan_rect=(0.0, 0.0, 1.0, 1.0)):
     普通页：标题和插画那一块成了「版心」，拿去和文字页对齐，整页出血的封面被平移了 5%，一边露出
     一条平色带。所以另加一条：页面带颜色（彩度明显的像素占 5% 以上），并且四周 3% 的边缘带里
     像纸的（够亮的）像素不到一半——画面铺到了边上。黑白扫描边不会误判：它是黑的、不带颜色。
-    带白边的彩色封面不算，它照常处理，需要的话手动「本页不修正」。只看扫描图的范围。
+    带白边的彩色封面不算，它照常处理，需要的话手动「本页不纠偏居中」。只看扫描图的范围。
     """
     if img.ndim != 3:
         return False
@@ -570,10 +595,41 @@ def page_box(info, ref, key="adjust"):
 
 
 def align_box(info, ref):
-    """这一页**对齐用的**版心。调红框本身不移动页面（用户要求：曾经每调一下页面就跟着重新对齐一次）；
-    用户点「版心居中」时，那一刻的红框记在 ref["align"] 里（格式同 ref["adjust"]），从此按它对齐。
-    之后再调红框，对齐仍按居中那一刻的，直到再点一次。去污、「与邻页相同」看的始终是红框（page_box）。"""
-    return page_box(info, ref, "align")
+    """这一页**自动对齐用的**版心：不含用户对红框的微调。调红框本身不移动页面（用户要求：曾经每调一下
+    页面就跟着重新对齐一次）；用户按「版心：靠左/居中/…」时，界面按那一刻的红框算出平移量，记在
+    ref["shift"] 里（page_shift），从此就用它。去污、「与邻页相同」看的始终是红框（page_box）。"""
+    return page_box(info, ref, "__none__")
+
+
+def page_shift(info, ref):
+    """用户明确指定的平移量 (dx, dy)（按「版心：…」按钮、手动调整的结果），没有为 None。挂在 ref["shift"] 上。"""
+    if ref:
+        value = ref.get("shift", {}).get(info.index)
+        if value is not None:
+            return tuple(value)
+    return None
+
+
+def standard_edges(ref):
+    """全书标准版心居中放在页面上时的四条边 (左, 上, 右, 下)：「靠左/靠上/靠右/靠下」贴的就是它们。"""
+    if not ref:
+        return (0.0, 0.0, 1.0, 1.0)
+    wx, wy = ref["ext"]
+    return ((1 - wx) / 2, (1 - wy) / 2, (1 + wx) / 2, (1 + wy) / 2)
+
+
+def notable_pages(infos, ref):
+    """版心比标准明显窄或矮（NOTABLE_SHORTFALL）的页：自动居中八成不对（半页、缩进的页、被切掉的页），
+    界面把它们在滚动条上标黄，让用户逐页确认。"""
+    if not ref:
+        return set()
+    wx, wy = ref["ext"]
+    flagged = set()
+    for info in infos:
+        box = align_box(info, ref)
+        if box and (wx - (box[2] - box[0]) > NOTABLE_SHORTFALL or wy - (box[3] - box[1]) > NOTABLE_SHORTFALL):
+            flagged.add(info.index)
+    return flagged
 
 
 def keystone_of(info, ref):
@@ -632,6 +688,70 @@ def keystone_image(img, quad, scale=1, nearest=False):
                                borderMode=cv2.BORDER_CONSTANT, borderValue=tuple(float(v) for v in bg))
 
 
+# ---------------------------------------------------------------- 高清化（外部程序 realesrgan-ncnn-vulkan）
+
+SR_EXE = "realesrgan-ncnn-vulkan"
+SR_MODEL = "realesrgan-x4plus-anime"   # 三个自带的模型里线条最干净、网点化成平色最自然的一个（实测比 x4plus 快 4 倍）
+SR_SCALE = 4                         # 模型固定放大 4 倍；灰度页最后缩回 2 倍输出，黑白页直接以 4 倍分辨率二值化
+SR_DOWNLOAD = "https://github.com/xinntao/Real-ESRGAN/releases（realesrgan-ncnn-vulkan-…-windows.zip）"
+
+
+def find_sr_exe():
+    """找 realesrgan-ncnn-vulkan 的可执行文件：环境变量 PDF_RESHAPE_SR、~/.pdf_reshape/realesrgan/、程序目录、PATH。
+    找不到返回 None。它是独立的可执行文件（自带 Vulkan 推理，不需要 Python 依赖），任何支持 Vulkan 的显卡都能跑。"""
+    candidates = [os.environ.get("PDF_RESHAPE_SR"),
+                  Path.home() / ".pdf_reshape" / "realesrgan" / (SR_EXE + ".exe"),
+                  Path(__file__).resolve().parent / "realesrgan" / (SR_EXE + ".exe"),
+                  shutil.which(SR_EXE)]
+    for c in candidates:
+        if c and Path(c).is_file():
+            return str(c)
+    return None
+
+
+def super_resolve(img, exe=None, model=SR_MODEL, scale=SR_SCALE, progress=None):
+    """用 Real-ESRGAN 把图像放大 scale 倍（AI 超分）。返回放大后的图；程序不在或失败时抛 RuntimeError。
+
+    走临时文件 + 子进程：图像先写成 PNG，程序读进去、写出来。一页 1200×1700 的图在入门显卡上约 1 分钟。
+    只给用户逐页指定的页用（照片、插画、低分辨率的书）；AI 会「猜」细节，文字页要用放大镜核对。
+    程序每算完一块就往 stderr 打一行百分比（"12.50%"），progress(0～1) 据此报进度——一页一分钟没有进度
+    用户不知道它是不是在干活（用户报的）。
+    """
+    exe = exe or find_sr_exe()
+    if not exe:
+        raise RuntimeError("找不到 realesrgan-ncnn-vulkan，请下载后放到 ~/.pdf_reshape/realesrgan/：" + SR_DOWNLOAD)
+    with tempfile.TemporaryDirectory(prefix="pdf_reshape_sr_") as tmp:
+        src, dst = os.path.join(tmp, "in.png"), os.path.join(tmp, "out.png")
+        cv2.imwrite(src, img)
+        proc = subprocess.Popen([exe, "-i", src, "-o", dst, "-s", str(scale), "-n", model,
+                                 "-m", str(Path(exe).parent / "models")],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace",
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        tail = []
+        for line in proc.stderr:
+            line = line.strip()
+            tail = (tail + [line])[-5:]
+            if progress and line.endswith("%"):
+                try:
+                    progress(min(float(line[:-1]) / 100, 1.0))
+                except ValueError:
+                    pass
+        proc.wait()
+        out = cv2.imread(dst, cv2.IMREAD_UNCHANGED if img.ndim == 3 else cv2.IMREAD_GRAYSCALE)
+        if proc.returncode != 0 or out is None:
+            raise RuntimeError("高清化失败：" + " / ".join(tail)[-300:])
+    if progress:
+        progress(1.0)
+    if out.ndim == 3 and out.shape[2] == 4:
+        out = out[:, :, :3]
+    return out
+
+
+def sr_of(info, ref, opts=None):
+    """这一页要不要高清化：用户逐页指定（ref["sr"]），和 cleanup 一样挂在 ref 上。"""
+    return bool(ref and info.mode != "copy" and info.index in ref.get("sr", ()))
+
+
 def cleanup_box(info, ref):
     """用户对这一页指定了「去除边缘污染」时，返回它的红框（对齐用的版心），否则返回 None。
 
@@ -684,16 +804,15 @@ def content_box(info, ref):
 
 
 def axis_shift(lo, hi, med_ext, edges, along_lines):
-    """单个方向上的平移量（归一化）。
+    """单个方向上的平移量（归一化）。**只给漫画用**：文字书一律居中，不走这套规则（见 compute_shift）。
 
     edges 是 [(本页所属奇偶类的版心两边位置中位数), (另一类的)]；
     along_lines 表示这个方向是不是沿着文字行的方向（横排书的水平方向）。
 
     1. 整页（版心和标准版心一样大）：直接居中。
-    2. 沿文字行的方向上只是略窄（目录、诗歌、整体缩进的段落）：看它窄在哪一边。通常是一边和
-       正文对齐、缩进全在另一边——那就把对齐的那一边贴齐标准版心，缩进原样保留，不能居中
-       （居中会把缩进平摊到两边，这一页就和前后页错开了）。两边缩得差不多的才是居中排版的
-       内容，直接居中。扫描位置的抖动一般只有 1% 多，比缩进量小得多，所以分得清。
+    2. 沿文字行的方向上只是略窄（目录、诗歌、整体缩进的段落）：直接居中。曾经有一条「一侧缩进」
+       的规则（一边和正文对齐、缩进全在另一边→贴齐对齐的那一边），几何上分不清「缩进」和
+       「只是整块窄一点」（《语文第六册》第 335 页），用户要求删掉。
     3. 半页（章末、章首、没有页眉的页等）：直接居中会让文字偏离它该在的位置。如果它
        有一边本来就和标准版心的边缘基本重合（章末页的上边、章首页的下边），就把这一边
        贴齐标准版心。先和本页所属的奇偶类比，对不上再和另一类比——页序的奇偶不一定
@@ -709,10 +828,6 @@ def axis_shift(lo, hi, med_ext, edges, along_lines):
     std_lo = (1 - med_ext) / 2
     std_hi = std_lo + med_ext
     if along_lines and slightly_smaller:
-        # 取两边里更吻合的那一类来比（页序的奇偶不可靠）
-        d_lo, d_hi = min(((abs(lo - e[0]), abs(hi - e[1])) for e in edges), key=min)
-        if min(d_lo, d_hi) <= FLUSH_RATIO * max(d_lo, d_hi):
-            return std_lo - lo if d_lo <= d_hi else std_hi - hi
         return centered
     for med_lo, med_hi in edges:
         d_lo, d_hi = abs(lo - med_lo), abs(hi - med_hi)
@@ -723,9 +838,14 @@ def axis_shift(lo, hi, med_ext, edges, along_lines):
     return std_lo - sum(e[0] for e in edges) / len(edges)
 
 
-def compute_shift(info, ref, per_page):
+def compute_shift(info, ref, per_page, book="text"):
+    """这一页的平移量 (dx, dy)。用户指定过的（「版心：…」按钮、手动调整）直接用；否则文字书一律把自动
+    检测的版心居中（用户要求：统一居中，半页、缩进页等由用户看着滚动条上的黄标逐页处理），漫画走 axis_shift。"""
+    fixed = page_shift(info, ref)
+    if fixed is not None:
+        return fixed
     x0, y0, x1, y1 = align_box(info, ref)
-    if per_page or ref is None:
+    if per_page or ref is None or book != "manga":
         return (1 - (x1 - x0)) / 2 - x0, (1 - (y1 - y0)) / 2 - y0
     own, other = ref[info.index % 2], ref[1 - info.index % 2]
     vertical = ref["vertical"]      # 按全书多数页的排版方向，不看单页（单页可能误判）
@@ -831,13 +951,13 @@ def flatten_paper(img):
 
 
 def margin_clean_of(info, opts, skip=False):
-    """这一页要不要做全局的「版心外去污染」：选项开着、是黑白二值页（用户定的：灰度/彩色页不动）、
-    用户没有指定「本页不修正」（不修正的页只接受逐页指定的去污）。"""
-    return bool(opts.clean_margin and info.bilevel and not skip and info.mode != "copy")
+    """这一页要不要做全局的「版心外去污染」：选项开着、是黑白页（1bit 的，或者存成 4bit/8bit 但实际上是
+    黑白的；用户定的：灰度/彩色页不动）、用户没有指定「本页不纠偏居中」（不纠偏居中的页只接受逐页指定的去污）。"""
+    return bool(opts.clean_margin and (info.bilevel or info.mono) and not skip and info.mode != "copy")
 
 
 def flatten_of(info, opts, skip=False):
-    """这一页要不要做纸面找平：选项开着、是灰度/彩色页、用户没有指定「本页不修正」。
+    """这一页要不要做纸面找平：选项开着、是灰度/彩色页、用户没有指定「本页不纠偏居中」。
 
     不按 info.shade 逐页取舍：找平不像显示增强那样有体积的代价，而漫画要的是页与页一致——
     只找平有灰影的页，翻到没灰影的页纸色就从白跳回灰。灰影的多少只用来给建议（recommend_flatten）。
@@ -906,7 +1026,7 @@ def transform_image(img, info, angle, shift, clean_margin, scale=1, bbox=None, c
             pad = 0.004
             rect = (max(int((box[0] + shift[0] - pad) * w), 0), max(int((box[1] + shift[1] - pad) * h), 0),
                     min(int((box[2] + shift[0] + pad) * w), w), min(int((box[3] + shift[1] + pad) * h), h))
-            out = remove_margin_stains(out, rect, info.bilevel)
+            out = remove_margin_stains(out, rect, info.bilevel or info.mono)   # 实际上是黑白的页也直接涂白
     return out
 
 
@@ -1019,7 +1139,7 @@ def assess_enhancement(gray, dpi):
 
 
 def enhancement_of(info, opts, skip=False):
-    """这一页实际要做的增强：选项开着、这一页值得增强、用户没有指定「本页不修正」。"""
+    """这一页实际要做的增强：选项开着、这一页值得增强、用户没有指定「本页不纠偏居中」。"""
     return info.enhance if opts.enhance and info.bilevel and not skip and info.mode != "copy" else ""
 
 
@@ -1080,8 +1200,30 @@ def vector_stream(bw, width, height):
     return "\n".join(parts).encode("ascii")
 
 
-def render_page(doc, info, ref, opts, angle, shift, skip=False):
-    """取图、变换、增强，得到这一页最终的图像。返回 (图像, 实际用的增强方法)。"""
+SR_CACHE = {}               # 高清化的结果 {键: 图像}：预览算过的页处理时直接用，一页一分钟不能白算；只留最近几页
+SR_CACHE_MAX = 6
+
+
+def render_page(doc, info, ref, opts, angle, shift, skip=False, progress=None):
+    """取图、变换、增强，得到这一页最终的图像。返回 (图像, 实际用的增强方法)。progress 只在高清化时用（0～1）。"""
+    if sr_of(info, ref):
+        # 高清化：先按平常那样变换（不放大、不增强——AI 放大取代它们），再交给 Real-ESRGAN 放大 4 倍。
+        # 黑白页直接以 4 倍分辨率二值化（笔画圆润，仍是 1bit）；灰度/彩色页缩回 2 倍输出
+        plain_opts = Options(**{**opts.__dict__, "upscale": False, "enhance": False})
+        key = (doc.name, info.index, round(angle, 3), round(shift[0], 4), round(shift[1], 4), keystone_of(info, ref),
+               cleanup_box(info, ref), margin_clean_of(info, plain_opts, skip), flatten_of(info, plain_opts, skip),
+               plain_opts.dpi, skip)
+        if key not in SR_CACHE:
+            base, _ = render_page(doc, info, dict(ref, sr=()), plain_opts, angle, shift, skip)
+            big = super_resolve(base, progress=progress)
+            if info.bilevel:
+                big = cv2.threshold(to_gray(big), 127, 255, cv2.THRESH_BINARY)[1]
+            else:
+                big = cv2.resize(big, None, fx=2 / SR_SCALE, fy=2 / SR_SCALE, interpolation=cv2.INTER_AREA)
+            while len(SR_CACHE) >= SR_CACHE_MAX:
+                del SR_CACHE[next(iter(SR_CACHE))]
+            SR_CACHE[key] = big
+        return SR_CACHE[key], "sr"
     method = enhancement_of(info, opts, skip)
     grow = enhancement_scale(method)                             # 增强本身要的放大，旋转不旋转都照做
     flat = flatten_of(info, opts, skip)
@@ -1185,6 +1327,7 @@ def analyze_page(doc, index, opts):
         scale = ANALYSIS_LONG_SIDE / max(gray.shape)
         small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA) if scale < 1 else gray
         info.shade = round(measure_shade(small, info.scan_rect), 1)
+        info.mono = is_mono(gray)           # 在原图上判断：缩小会把抗锯齿混成更多的中间调
     return info
 
 
@@ -1422,34 +1565,35 @@ def format_recommendation(infos, profile=None, max_angle=5.0, book="text"):
 def plan_page(info, ref, opts, skip=False):
     """根据分析结果和选项，决定这一页实际要做的旋转角度和平移量。
 
-    skip 表示用户指定了「本页不修正」：不旋转、不平移，但它的分析结果仍然参与全书标准版心的统计。
-    「不修正」管的是位置，不挡「去除边缘污染」：封面、插图页这类不想让程序挪动的页恰恰常有黑边。
+    skip 表示用户指定了「本页不纠偏居中」：不旋转、不平移，但它的分析结果仍然参与全书标准版心的统计。
+    「不纠偏居中」管的是位置，不挡「去除边缘污染」：封面、插图页这类不想让程序挪动的页恰恰常有黑边。
     同时指定了去污的页不能原样复制，而是位置不动（像素原样搬运）、只去污。
     """
+    sr = "  高清化（AI 放大，一页约 1～5 分钟）" if sr_of(info, ref) else ""
     if keystone_of(info, ref):
-        # 梯形校正是用户明确指定的：优先于「本页不修正」；校正后版心铺满整页，不再旋转、平移
+        # 梯形校正是用户明确指定的：优先于「本页不纠偏居中」；校正后版心铺满整页，不再旋转、平移
         method = enhancement_of(info, opts)
-        return 0.0, (0.0, 0.0), False, "梯形校正（版心铺满整页）" + (f"  显示增强: {describe_enhancement(method)}" if method else "")
+        return 0.0, (0.0, 0.0), False, "梯形校正（版心铺满整页）" + (f"  显示增强: {describe_enhancement(method)}" if method else "") + sr
     if skip:
-        if cleanup_box(info, ref) is not None:
-            return 0.0, (0.0, 0.0), False, "本页不修正（手动指定）  去除边缘污染"
-        return 0.0, (0.0, 0.0), True, "本页不修正（手动指定）"
+        if cleanup_box(info, ref) is not None or sr:
+            return 0.0, (0.0, 0.0), False, "本页不纠偏居中（手动指定）" + ("  去除边缘污染" if cleanup_box(info, ref) is not None else "") + sr
+        return 0.0, (0.0, 0.0), True, "本页不纠偏居中（手动指定）"
     if info.full_bleed_color and opts.book == "text":
         # 文字书里的彩色封面、整页彩图：原样保留（漫画整页都是画面，出血的彩页也照常纠偏、对齐）。
-        # 和「本页不修正」一样，用户逐页指定的去污照做
-        if cleanup_box(info, ref) is not None:
-            return 0.0, (0.0, 0.0), False, "彩色整页图片，位置不动  去除边缘污染"
+        # 和「本页不纠偏居中」一样，用户逐页指定的去污照做
+        if cleanup_box(info, ref) is not None or sr:
+            return 0.0, (0.0, 0.0), False, "彩色整页图片，位置不动" + ("  去除边缘污染" if cleanup_box(info, ref) is not None else "") + sr
         return 0.0, (0.0, 0.0), True, "彩色整页图片，原样保留"
     angle = info.angle if opts.deskew and abs(info.angle) >= opts.min_angle else 0.0
     shift = (0.0, 0.0)
     if info.bbox and opts.center:
-        shift = compute_shift(info, ref, opts.per_page)
+        shift = compute_shift(info, ref, opts.per_page, opts.book)
     trivial = angle == 0.0 and max(abs(shift[0]), abs(shift[1])) < 0.003
     cleanup = cleanup_box(info, ref) is not None
     method = enhancement_of(info, opts)
     flat = flatten_of(info, opts)
     clean = margin_clean_of(info, opts)
-    untouched = info.mode == "copy" or (trivial and not clean and not cleanup and not method and not flat)
+    untouched = info.mode == "copy" or (trivial and not clean and not cleanup and not method and not flat and not sr)
     if untouched:
         status = info.note or "无需修正"
     else:
@@ -1457,6 +1601,7 @@ def plan_page(info, ref, opts, skip=False):
                   + ("  去除边缘污染" if cleanup else "  版心外去污染" if clean else "")
                   + (f"  显示增强: {describe_enhancement(method)}" if method else "")
                   + (f"  纸面找平（灰影 {info.shade:.0f} 级）" if flat else "")
+                  + sr
                   + (f"  ({info.note})" if info.note else ""))
     return angle, shift, untouched, status
 
@@ -1490,7 +1635,9 @@ def process_document(doc, infos, opts, output, progress=None, log=None, cancelle
         if untouched:
             out.insert_pdf(doc, from_page=info.index, to_page=info.index)
         else:
-            img, method = render_page(doc, info, ref, opts, angle, shift, skip=info.index in skip_pages)
+            # 高清化的页一页要一分钟：进度条在这一页的格子里按 AI 的进度往前走（k - 1 + 进度）
+            sub = (lambda f, k=k: progress(k - 1 + f, len(infos))) if progress and sr_of(info, ref) else None
+            img, method = render_page(doc, info, ref, opts, angle, shift, skip=info.index in skip_pages, progress=sub)
             add_output_page(out, page.rect, img, info, opts, method)
             changed += 1
         if log:
@@ -1543,6 +1690,10 @@ def estimate_output_size(doc, infos, ref, opts, skip_pages=(), delete_pages=(), 
         src = page_source_bytes(doc, doc[info.index])
         if untouched:
             copied_bytes += src
+            copied += 1
+        elif sr_of(info, ref):
+            # 高清化的页不抽样（AI 放大一页要一分钟），按经验倍数估：黑白页 4 倍分辨率的 1bit 约 4 倍，灰度页 2 倍分辨率约 3 倍
+            copied_bytes += src * (4 if info.bilevel else 3)
             copied += 1
         else:
             work.append((info, angle, shift, src))
@@ -1612,8 +1763,8 @@ def remap_toc(toc, kept):
     return result
 
 
-def preview_page(doc, info, ref, opts, skip=False):
-    """生成单页的处理前/处理后图像（供图形界面预览）。"""
+def preview_page(doc, info, ref, opts, skip=False, progress=None):
+    """生成单页的处理前/处理后图像（供图形界面预览）。progress 只在高清化时用（0～1）。"""
     page = doc[info.index]
     opts = opts.effective()
     angle, shift, untouched, status = plan_page(info, ref, opts, skip)
@@ -1622,7 +1773,7 @@ def preview_page(doc, info, ref, opts, skip=False):
     if untouched:
         after = before
     else:
-        after, method = render_page(doc, info, ref, opts, angle, shift, skip=skip)
+        after, method = render_page(doc, info, ref, opts, angle, shift, skip=skip, progress=progress)
         if "vector" in method:              # 矢量化的页：把实际写出来的那一页渲染成图，所见即所得
             with fitz.open() as tmp:
                 zoom = after.shape[1] / page.rect.width
@@ -1633,7 +1784,7 @@ def preview_page(doc, info, ref, opts, skip=False):
             after = cv2.threshold(to_gray(after), 127, 255, cv2.THRESH_BINARY)[1]
     box = None
     if info.bbox and not keystone_of(info, ref):   # 梯形校正过的页版心就是整页，没有红框可调
-        # 不动的页（不修正、无需修正）也画出红框：去污是按红框算的，得让用户先看到它
+        # 不动的页（不纠偏居中、无需修正）也画出红框：去污是按红框算的，得让用户先看到它
         b = page_box(info, ref)
         box = (b[0] + shift[0], b[1] + shift[1], b[2] + shift[0], b[3] + shift[1])
     return before, after, box, status
