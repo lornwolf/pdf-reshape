@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS pages (
     box_adjust  TEXT,                        -- 用户对版心四条边的手动微调 [左, 上, 右, 下]（JSON），没调过为 NULL
     box_align   TEXT,                        -- 用户点「版心居中」那一刻的 box_adjust：对齐按它算，没点过为 NULL
     keystone    TEXT,                        -- 梯形校正的四个角 [[x, y] × 4]（左上、右上、右下、左下，按原图归一化，JSON），没做过为 NULL
-    shift       TEXT,                        -- 用户指定的平移量 [dx, dy]（「版心：…」按钮、手动调整的结果，归一化，JSON），没指定为 NULL
+    shift       TEXT,                        -- 用户指定的平移量 [dx, dy]（「版心移动：…」按钮、手动调整的结果，归一化，JSON），没指定为 NULL
     confirmed   INTEGER NOT NULL DEFAULT 0,  -- 1 = 用户点过「确认完毕」（版心明显偏窄的页，滚动条上不再标黄）
     analysis    TEXT,                        -- 这一页的分析结果（PageInfo 的 JSON）
     PRIMARY KEY (book_id, page_index)

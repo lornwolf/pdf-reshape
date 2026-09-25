@@ -29,7 +29,7 @@ import cv2
 import fitz  # PyMuPDF
 import numpy as np
 
-ANALYSIS_VERSION = 9        # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
+ANALYSIS_VERSION = 10       # 倾斜/版心检测的算法版本。改了检测逻辑就加 1，让已保存的分析结果失效
 ANALYSIS_LONG_SIDE = 1200   # 分析用缩略图的长边像素数
 FULL_PAGE_TOLERANCE = 0.02  # 版心尺寸与标准版心相差在此以内（或更大）才算「整页」，否则按「半页」处理
 HANGING_TOLERANCE = 0.03    # 全部内容比标准的正文宽出这么多，才认为有东西（页码、页眉）挂在正文外面
@@ -38,7 +38,8 @@ EDGE_MATCH_TOLERANCE = 0.03  # 半页的版心边缘与同类页相差在此以�
 FLUSH_RATIO = 0.35          # 略窄的页：一边离标准版心的距离不到另一边的这个比例，就认为这一边是对齐的、缩进全在另一边
 NARROW_TOLERANCE = 0.12     # 版心只比标准版心小这么多以内时，可以放心地单独居中（误差不超过它的一半）
 NOTABLE_SHORTFALL = 0.04    # 版心比标准版心窄（或矮）这么多以上的页，界面在滚动条上标黄，提醒用户看一眼
-FULL_BLEED_RATIO = 0.95     # 内容占满页面超过这个比例时，视为整页图片，不处理
+FULL_BLEED_RATIO = 0.95     # 内容占满页面超过这个比例时，视为整页图片：文字书不处理，漫画照常处理（PageInfo.full_bleed）
+FULL_BLEED_MIN_CONF = 5.0   # 整页图片的倾斜检测置信度不到这个值就不旋转（没有文字行、分格框，投影法靠不住）
 COLOR_CHROMA = 20           # 页面里彩度（RGB 三通道的最大差）超过这个值的像素占 5% 以上，才算彩色页
 PAPER_LIKE = 200            # 页边一圈里亮度至少这么高的像素才算纸；见 is_full_bleed_color
 
@@ -59,6 +60,8 @@ class PageInfo:
     enhance: str = ""           # 「显示增强」对这一页适合用的方法，空 = 增强了也没有明显改善；见 assess_enhancement
     shade: float = 0.0          # 灰度/彩色页：页边的纸色比中部暗多少级（订口阴影）；见 measure_shade
     full_bleed_color: bool = False  # 彩色、画面一直铺到页边的页（封面等）：文字书里原样保留；见 is_full_bleed_color
+    full_bleed: bool = False    # 内容占满整页（版心宽高都超过 FULL_BLEED_RATIO）：文字书里当整页图片原样保留，
+                                # 漫画照常处理（出血的画面很常见，《スラムダンク 第27巻》193 页里有 79 页）；不参与标准版心的统计
     mono: bool = False          # 不是 1bit、但内容基本只有黑白两色的页（4bit/8bit 存的黑白页）；见 is_mono
     scan_rect: tuple = (0.0, 0.0, 1.0, 1.0)  # 扫描图在页面中的范围（归一化）
     # 以下两项每次 load_page_image 时重新填写，不依赖保存下来的分析结果
@@ -71,6 +74,8 @@ BOOK_TYPES = {"text": "文字书", "manga": "漫画书"}
 # 各类书在界面上显示、在处理中生效的「修正内容」选项。不在列表里的选项对这类书一律视为关闭（Options.effective）
 BOOK_OPTIONS = {"text": ("deskew", "center", "clean_margin", "upscale", "enhance"),      # 文字书本来就每页居中，没有「每页各自居中」
                 "manga": ("deskew", "center", "per_page", "flatten")}
+# 各类书和 Options 的默认值不同的选项：漫画默认不勾「版心居中」（用户定的）。界面上换类型、命令行 --book 都按它来
+BOOK_DEFAULTS = {"text": {}, "manga": {"center": False}}
 
 
 @dataclass
@@ -87,6 +92,11 @@ class Options:
     min_angle: float = 0.1      # 小于此角度不旋转
     dpi: int = 300              # 无法直接取原图的页面的渲染 DPI
     quality: int = 90           # JPEG 质量
+
+    @classmethod
+    def for_book(cls, book, **overrides):
+        """这类书的默认选项（BOOK_DEFAULTS 盖在 Options 的默认值上），再盖上 overrides。"""
+        return cls(book=book, **{**BOOK_DEFAULTS.get(book, {}), **overrides})
 
     def effective(self):
         """按书的类型把不适用的选项关掉之后的副本：文字书没有「纸面找平」，漫画没有「显示增强」等。
@@ -215,6 +225,46 @@ def to_gray(img):
     return img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
 
+def binarize(gray_small, scan_rect=(0.0, 0.0, 1.0, 1.0)):
+    """Otsu 二值化成「墨迹」（255 = 墨），扫描图之外清零。返回 (掩码, 扫描图在掩码里的像素范围)。"""
+    _, ink = cv2.threshold(gray_small, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    h, w = ink.shape
+    x0, y0 = int(np.floor(scan_rect[0] * w)), int(np.floor(scan_rect[1] * h))
+    x1, y1 = int(np.ceil(scan_rect[2] * w)), int(np.ceil(scan_rect[3] * h))
+    ink[:y0] = 0; ink[y1:] = 0; ink[:, :x0] = 0; ink[:, x1:] = 0
+    return ink, (x0, y0, x1, y1)
+
+
+def frame_ink(gray_small, scan_rect=(0.0, 0.0, 1.0, 1.0)):
+    """给倾斜检测找分格框用的墨迹：只二值化，**不去贴边的成分、不去细线**。
+
+    漫画的分格框常常贴着扫描图的边（出血的格子、裁得紧的扫描），make_ink_mask 把贴边的成分整个
+    去掉时，整个框连同框里和它相连的画都没了，剩下的只有格子里的排线和斜着的分格线，投影法就被
+    它们带偏了（《スラムダンク 第27巻》第 13 页被转了 -3.95°）。
+    但扫描黑边不能留：它贴着画布的边、内侧那条边是完全水平/竖直的直线，会被当成 0° 的框（合成测试
+    第 1 页因此从 2.3° 变成了 0.5°）。区分的办法是粗细：黑边是贴着边的一整条实心带子，分格框是细线——
+    先腐蚀掉细的东西只留粗块，粗块里贴着边的就是黑边，把它（连同周围两三个像素）抹掉；和它相连的
+    细线留下（不能像 make_ink_mask 那样整个连通成分一起去：框和框里的画常常连成一个成分）。
+    最外一圈 3 像素也抹掉：画布的边本身就是一条直线。
+    """
+    ink, (x0, y0, x1, y1) = binarize(gray_small, scan_rect)
+    scan = ink[y0:y1, x0:x1]
+    m = 3
+    thick = cv2.erode(scan, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+    n, labels, _, _ = cv2.connectedComponentsWithStats(thick, connectivity=8)
+    reach = m + 6                                   # 腐蚀掉了 5 像素，粗块离画布边 5 像素以内就算贴边
+    border = np.unique(np.concatenate([labels[:reach].ravel(), labels[-reach:].ravel(),
+                                       labels[:, :reach].ravel(), labels[:, -reach:].ravel()]))
+    keep = np.ones(n, dtype=bool)
+    keep[border] = False
+    keep[0] = True
+    band = np.where(keep[labels], 0, thick).astype(np.uint8)
+    band = cv2.dilate(band, cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15)))
+    scan[band > 0] = 0
+    ink[:y0 + m] = 0; ink[max(y1 - m, 0):] = 0; ink[:, :x0 + m] = 0; ink[:, max(x1 - m, 0):] = 0
+    return ink
+
+
 def make_ink_mask(gray_small, scan_rect=(0.0, 0.0, 1.0, 1.0)):
     """二值化得到「墨迹」掩码，并清掉不属于版面内容的东西。
 
@@ -224,13 +274,10 @@ def make_ink_mask(gray_small, scan_rect=(0.0, 0.0, 1.0, 1.0)):
        文字范围之内，不影响版心的判定。
     3. 远离其他内容的孤立小污点。
     """
-    _, ink = cv2.threshold(gray_small, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    ink, (x0, y0, x1, y1) = binarize(gray_small, scan_rect)
     h, w = ink.shape
 
     # 1. 贴边成分（边缘 3 像素以内都算贴边，容许坐标取整的误差）
-    x0, y0 = int(np.floor(scan_rect[0] * w)), int(np.floor(scan_rect[1] * h))
-    x1, y1 = int(np.ceil(scan_rect[2] * w)), int(np.ceil(scan_rect[3] * h))
-    ink[:y0] = 0; ink[y1:] = 0; ink[:, :x0] = 0; ink[:, x1:] = 0
     scan = ink[y0:y1, x0:x1]
     n, labels, _, _ = cv2.connectedComponentsWithStats(scan, connectivity=8)
     m = 3
@@ -293,26 +340,124 @@ def rotate(img, angle, border_value=0, flags=cv2.INTER_LINEAR):
                           borderMode=cv2.BORDER_CONSTANT, borderValue=border_value)
 
 
-def detect_skew(ink, max_angle):
+FRAME_MIN_RUN = 0.1         # 算「直边」的连续段至少要有页面长边的 10% 长
+FRAME_MIN_STRENGTH = 0.6    # 水平、竖直两个方向的直边总长都够页面长边的 0.6 倍，才算有矩形的分格框（一个框的四条边）
+FRAME_DISAGREE = 0.5        # 投影法的角度和按分格框拟合出的角度差这么多以上，才改用框的角度
+FRAME_SQUARE_TOLERANCE = 0.25   # 横线和竖线各自拟合的角度差超过这么多，就不是刚性转过的矩形，不能当框用……
+FRAME_SQUARE_TOLERANCE_GROSS = 0.6   # ……除非投影法错了 1° 以上：那时框只要大致方正就该信
+
+
+def frame_scores(frame, angles):
+    """每个角度下分格框的证据：把墨迹的轮廓转到该角度，数够长的水平直段和竖直直段的总长，取两者中小的，
+    按页面长边归一化（1.0 = 有一个长边那么长的直边）。
+
+    漫画的格子是矩形：真正的倾斜角上横线、竖线都有；斜着的分格线只有一个方向的直边，取小的那个就
+    把它排除了。网点、排线、文字的轮廓都是短段，数不进来。轮廓只取一圈（墨迹减去腐蚀后的墨迹）：
+    实心的黑块内部每一行都是长段，不能算。「够长的连续段」用一维的开运算取：核比段长的都被抹掉。
+    在缩小一半的图上做：省时间（每页 0.2 秒 → 0.06 秒），而且线相对更粗，0.5° 的粗搜格子里
+    差半格的角度直边也断不开。
+    """
+    frame = cv2.resize(frame, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    frame = np.where(frame >= 64, 255, 0).astype(np.uint8)         # 2 像素的线缩成 1 像素后也要留下
+    outline = cv2.subtract(frame, cv2.erode(frame, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))))
+    min_len = int(FRAME_MIN_RUN * max(frame.shape))
+    horizontal = cv2.getStructuringElement(cv2.MORPH_RECT, (min_len, 1))
+    vertical = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_len))
+    out = []
+    for a in angles:
+        r = rotate(outline, a, flags=cv2.INTER_NEAREST)
+        out.append(min(cv2.countNonZero(cv2.morphologyEx(r, cv2.MORPH_OPEN, horizontal)),
+                       cv2.countNonZero(cv2.morphologyEx(r, cv2.MORPH_OPEN, vertical))))
+    return np.array(out) / max(frame.shape)          # 按（缩小后的）页面长边归一化
+
+
+def refine_frame_angle(frame, coarse):
+    """在 coarse 附近按分格框的直边精确求倾斜角：转到 coarse 后，把轮廓里够长的水平段、竖直段各自
+    拟合成直线，取按长度加权的中位角度。直线拟合能到 0.05° 以内；投影法在漫画上细找不可靠——网点
+    的点阵在行、列两个方向上同时出尖峰（《第23巻》第 15 页 0.9° 处的峰比 0° 的框尖 10 倍）。
+    返回 (角度, 横线和竖线各自中位角度的差)；后者是「框是不是刚性转过的矩形」的依据，见 detect_skew。
+    有一个方向一条能拟合的直边都没有时返回 None：粗搜的证据靠不住。
+    """
+    def weighted_median(angles, weights):
+        order = np.argsort(angles)
+        cum = np.cumsum(np.array(weights)[order])
+        return float(np.array(angles)[order][int(np.searchsorted(cum, cum[-1] / 2))])
+
+    outline = cv2.subtract(frame, cv2.erode(frame, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))))
+    r = rotate(outline, coarse, flags=cv2.INTER_NEAREST)
+    min_len = int(FRAME_MIN_RUN * max(frame.shape))
+    medians, angles, weights = [], [], []
+    for vertical in (False, True):
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, min_len) if vertical else (min_len, 1))
+        kept = cv2.morphologyEx(r, cv2.MORPH_OPEN, kernel)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(kept, connectivity=8)
+        found, found_w = [], []
+        for i in range(1, n):
+            x, y, w, h = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP], stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+            if (w if vertical else h) < 2:  # 只有一行（列）粗的段是斜线被开运算切下来的台阶，看不出角度，只会拉向 0
+                continue
+            ys, xs = np.nonzero(labels[y:y + h, x:x + w] == i)
+            if vertical:                    # 竖线向下时 x 减小（dx/dy < 0）的是顺时针歪的页，要正角度
+                slope = np.polyfit(ys, xs, 1)[0]
+                found.append(-math.degrees(math.atan(slope)))
+            else:                           # 横线向右下降（dy/dx > 0）的是顺时针歪的页，要正角度
+                slope = np.polyfit(xs, ys, 1)[0]
+                found.append(math.degrees(math.atan(slope)))
+            found_w.append(max(w, h))
+        if not found:
+            return None
+        medians.append(weighted_median(found, found_w))
+        angles += found
+        weights += found_w
+    delta = weighted_median(angles, weights)
+    # 粗搜的 0.5° 格子分不清 1° 以内的差别（直边够粗时差 1° 也断不开），所以允许拟合修正到 ±1°
+    return coarse + float(np.clip(delta, -1.0, 1.0)), abs(medians[0] - medians[1])
+
+
+def detect_skew(ink, max_angle, frame=None):
     """投影轮廓法：文字行完全水平（竖排则列完全垂直）时，投影的起伏最剧烈。
 
     同时计算行方向和列方向的得分，取峰值更尖锐的一方，因此横排、竖排都适用。
     返回 (角度, 置信度, 是否竖排)。
+
+    frame（frame_ink 的结果，含分格框）用来防投影法被漫画带偏：斜着的分格线、网点的点阵在投影上
+    也会出很尖的峰（《スラムダンク 第27巻》第 13 页被转了 -3.95°，第 8 页 -2.40°），格子本身反而
+    没有文字行那样的起伏。页上有矩形的分格框（frame_scores 两个方向的直边都够长）时，按框的直边
+    拟合出角度（refine_frame_angle），和投影法差 0.5° 以上就改用框的。文字书没有框，不受影响。
     """
-    def scores(angle):
-        r = rotate(ink, angle, flags=cv2.INTER_NEAREST)
+    def scores(img, angle):
+        r = rotate(img, angle, flags=cv2.INTER_NEAREST)
         rows = r.sum(axis=1, dtype=np.float64)
         cols = r.sum(axis=0, dtype=np.float64)
         return np.sum(np.diff(rows) ** 2), np.sum(np.diff(cols) ** 2)
 
-    def search(angles):
-        s = np.array([scores(a) for a in angles])       # 形状 (N, 2)
+    def search(img, angles):
+        s = np.array([scores(img, a) for a in angles])       # 形状 (N, 2)
         sharp = s.max(axis=0) / (np.median(s, axis=0) + 1e-9)
         axis = int(np.argmax(sharp))
         return angles[int(np.argmax(s[:, axis]))], sharp[axis], axis
 
-    coarse, conf, axis = search(np.arange(-max_angle, max_angle + 1e-6, 0.5))
-    fine, _, _ = search(np.arange(coarse - 0.5, coarse + 0.5 + 1e-6, 0.05))
+    angles = np.arange(-max_angle, max_angle + 1e-6, 0.5)
+    coarse, conf, axis = search(ink, angles)
+    fine, _, _ = search(ink, np.arange(coarse - 0.5, coarse + 0.5 + 1e-6, 0.05))
+    if frame is not None:
+        fs = frame_scores(frame, angles)
+        k = int(np.argmax(fs))
+        if fs[k] >= FRAME_MIN_STRENGTH:
+            # 有框就按框的直边拟合出精确的角度，和投影法的结果差得多才改用它。粗搜格子上的直边总长
+            # 是个平顶（差 1° 以内断不开），不能拿它比谁高（曾这样比，《第27巻》第 59 页框在 0°、
+            # 投影法说 1.1°，没比出来）；细找也不能用投影：它会往错的峰上靠（《第23巻》第 15 页
+            # 投影法说 0.85°，框在 0.6°，细找限制在 ±0.5° 里就停在 0.5° 的边上）
+            result = refine_frame_angle(frame, float(angles[k]))
+            if result is not None:
+                refined, squareness = result
+                gap = abs(refined - fine)
+                # 横线和竖线各自的角度对得上才是刚性转过的矩形。文字书里的表格对不上——纸面有弧度，表线
+                # 彼此差零点几度，这时文字行（投影法）才是准的（《语文第二册》第 124 页差点被改了 0.5°）。
+                # 但投影法错得离谱（差 1° 以上）时不能这么苛刻：第 13 页的框横竖就差 0.29°
+                tolerance = FRAME_SQUARE_TOLERANCE if gap < 1.0 else FRAME_SQUARE_TOLERANCE_GROSS
+                if gap >= FRAME_DISAGREE and squareness <= tolerance:
+                    return refined, float(conf), axis == 1
     return float(fine), float(conf), axis == 1
 
 
@@ -461,18 +606,27 @@ def analyze(img, info, max_angle):
     if cv2.countNonZero(ink) < 0.001 * ink.size:
         info.mode, info.note = "copy", "空白页或整页图片"
         return
-    angle, conf, info.vertical = detect_skew(ink, max_angle)
+    angle, conf, info.vertical = detect_skew(ink, max_angle, frame_ink(small, info.scan_rect))
     if conf < 1.2:
         angle, info.note = 0.0, "倾斜不明确，不旋转"
     info.angle = angle
+    upright = ink
     ink = rotate(ink, angle, flags=cv2.INTER_NEAREST)
     bbox, core_bbox, outliers = detect_content_bbox(ink)
     if bbox is None:
         info.mode, info.note = "copy", "未检测到版心"
         return
     if bbox[2] - bbox[0] > FULL_BLEED_RATIO and bbox[3] - bbox[1] > FULL_BLEED_RATIO:
-        info.mode, info.note = "copy", "内容占满整页"
-        return
+        # 只做标记，分析结果照存：是原样保留还是照常处理由 plan_page 按书的类型决定（曾经在这里直接记成
+        # 「原样复制」，漫画里出血的页因此既不纠偏也不能高清化，用户报的）
+        info.full_bleed, info.note = True, "内容占满整页"
+        if angle and conf < FULL_BLEED_MIN_CONF:
+            # 铺满整页的画面既没有文字行也没有分格框，投影法只能靠排线、网点，常常错得离谱：三卷
+            # 《スラムダンク》188 页出血页里，置信度不到 5 的有二十几页被测成 1°～5°（都是正的页），
+            # 置信度 5 以上的全在 1.2° 以内。这种页宁可不转
+            info.angle, info.note = 0.0, "内容占满整页，倾斜不明确，不旋转"
+            ink = upright
+            bbox, core_bbox, outliers = detect_content_bbox(ink)
     info.bbox, info.core_bbox, info.outliers = bbox, core_bbox, outliers
     # 两个方向的密度范围都存下来：哪个方向是文字行的方向，要等全书分析完才知道（单页会误判）
     # 两个方向各求各的，求不出来的那个方向就用版心本身：横排书在竖直方向上本来就求不出来
@@ -486,8 +640,9 @@ def analyze(img, info, max_angle):
 
 def _reference_of(boxes, infos):
     arr = np.array([b for _, b in boxes])
+    ids = {i for i, _ in boxes}
     ref = {"ext": (np.median(arr[:, 2] - arr[:, 0]), np.median(arr[:, 3] - arr[:, 1])),
-           "vertical": sum(p.vertical for p in infos if p.bbox) * 2 > len(boxes)}
+           "vertical": sum(p.vertical for p in infos if p.index in ids) * 2 > len(boxes)}
     for parity in (0, 1):
         sub = np.array([b for i, b in boxes if i % 2 == parity])
         ref[parity] = np.median(sub if len(sub) >= 4 else arr, axis=0)
@@ -546,7 +701,10 @@ def compute_reference(infos):
       当成「窄了」而贴到一边去。对齐要看的是正文，不是页码。
     标准版心的统计用的是对齐用的版心。
     """
-    raw = [(p.index, p.bbox) for p in infos if p.bbox]
+    # 内容占满整页的页（出血的漫画页、封面）有版心、也要对齐，但不参与标准版心的统计：它的版心就是整页，
+    # 漫画里这种页占到四成，算进去标准版心就不是分格框的大小了。整本都是这种页时只好都算上
+    stat = {p.index for p in infos if p.bbox and not p.full_bleed} or {p.index for p in infos if p.bbox}
+    raw = [(p.index, p.bbox) for p in infos if p.index in stat]
     if not raw:
         return None
     first = _reference_of(raw, infos)
@@ -563,13 +721,14 @@ def compute_reference(infos):
     # 全部内容比标准的正文明显宽时才用（门槛 3%：外挂的页码至少伸出去 5%；而「标准」是按密度求的，
     # 行尾参差不齐的书里它本来就比实际内容窄一点，门槛定在 2% 会误伤正常的页）。其余的页直接用全部内容：整行的文字只有寥寥几行的页
     # （诗歌、对话、字表、目录），整行所在的列达不到「叠了很多行」的门槛，求出来的范围会偏窄
-    standard = _reference_of(sorted(boxes.items()), infos)["ext"][0 if lo == 0 else 1]
+    counted = lambda: sorted((i, b) for i, b in boxes.items() if i in stat)
+    standard = _reference_of(counted(), infos)["ext"][0 if lo == 0 else 1]
     for index, whole in content.items():
         if whole[hi] - whole[lo] <= standard + HANGING_TOLERANCE:
             box = list(boxes[index])
             box[lo], box[hi] = whole[lo], whole[hi]
             boxes[index] = tuple(box)
-    ref = _reference_of(sorted(boxes.items()), infos)
+    ref = _reference_of(counted(), infos)
     ref["boxes"], ref["content"] = boxes, content
     return ref
 
@@ -596,13 +755,13 @@ def page_box(info, ref, key="adjust"):
 
 def align_box(info, ref):
     """这一页**自动对齐用的**版心：不含用户对红框的微调。调红框本身不移动页面（用户要求：曾经每调一下
-    页面就跟着重新对齐一次）；用户按「版心：靠左/居中/…」时，界面按那一刻的红框算出平移量，记在
+    页面就跟着重新对齐一次）；用户按「版心移动：靠左/居中/…」时，界面按那一刻的红框算出平移量，记在
     ref["shift"] 里（page_shift），从此就用它。去污、「与邻页相同」看的始终是红框（page_box）。"""
     return page_box(info, ref, "__none__")
 
 
 def page_shift(info, ref):
-    """用户明确指定的平移量 (dx, dy)（按「版心：…」按钮、手动调整的结果），没有为 None。挂在 ref["shift"] 上。"""
+    """用户明确指定的平移量 (dx, dy)（按「版心移动：…」按钮、手动调整的结果），没有为 None。挂在 ref["shift"] 上。"""
     if ref:
         value = ref.get("shift", {}).get(info.index)
         if value is not None:
@@ -839,7 +998,7 @@ def axis_shift(lo, hi, med_ext, edges, along_lines):
 
 
 def compute_shift(info, ref, per_page, book="text"):
-    """这一页的平移量 (dx, dy)。用户指定过的（「版心：…」按钮、手动调整）直接用；否则文字书一律把自动
+    """这一页的平移量 (dx, dy)。用户指定过的（「版心移动：…」按钮、手动调整）直接用；否则文字书一律把自动
     检测的版心居中（用户要求：统一居中，半页、缩进页等由用户看着滚动条上的黄标逐页处理），漫画走 axis_shift。"""
     fixed = page_shift(info, ref)
     if fixed is not None:
@@ -1578,12 +1737,13 @@ def plan_page(info, ref, opts, skip=False):
         if cleanup_box(info, ref) is not None or sr:
             return 0.0, (0.0, 0.0), False, "本页不纠偏居中（手动指定）" + ("  去除边缘污染" if cleanup_box(info, ref) is not None else "") + sr
         return 0.0, (0.0, 0.0), True, "本页不纠偏居中（手动指定）"
-    if info.full_bleed_color and opts.book == "text":
-        # 文字书里的彩色封面、整页彩图：原样保留（漫画整页都是画面，出血的彩页也照常纠偏、对齐）。
-        # 和「本页不纠偏居中」一样，用户逐页指定的去污照做
+    if (info.full_bleed_color or info.full_bleed) and opts.book == "text":
+        # 文字书里的彩色封面、整页彩图、内容占满整页的页：原样保留（漫画整页都是画面，出血的页也照常
+        # 纠偏、对齐、找平、高清化）。和「本页不纠偏居中」一样，用户逐页指定的去污、高清化照做
+        what = "彩色整页图片" if info.full_bleed_color else "内容占满整页"
         if cleanup_box(info, ref) is not None or sr:
-            return 0.0, (0.0, 0.0), False, "彩色整页图片，位置不动" + ("  去除边缘污染" if cleanup_box(info, ref) is not None else "") + sr
-        return 0.0, (0.0, 0.0), True, "彩色整页图片，原样保留"
+            return 0.0, (0.0, 0.0), False, what + "，位置不动" + ("  去除边缘污染" if cleanup_box(info, ref) is not None else "") + sr
+        return 0.0, (0.0, 0.0), True, what + "，原样保留"
     angle = info.angle if opts.deskew and abs(info.angle) >= opts.min_angle else 0.0
     shift = (0.0, 0.0)
     if info.bbox and opts.center:
@@ -1819,7 +1979,8 @@ def main():
     ap.add_argument("--quality", type=int, default=None,
                     help="JPEG 质量 (默认: 分析全书后自动采用建议值；原文件不是 JPEG 时为 90)")
     ap.add_argument("--no-deskew", action="store_true", help="不做倾斜校正")
-    ap.add_argument("--no-center", action="store_true", help="不做版心居中")
+    ap.add_argument("--no-center", action="store_true", help="不做版心居中（漫画默认就不居中）")
+    ap.add_argument("--center", action="store_true", help="做版心居中（文字书默认就居中；漫画要居中时加上）")
     ap.add_argument("--per-page", action="store_true",
                     help="每页各自居中（默认会参照全书标准版心，避免半页内容跑到页面中间）")
     ap.add_argument("--clean-margin", action="store_true",
@@ -1835,9 +1996,10 @@ def main():
     args = ap.parse_args()
 
     output = args.output or default_output_path(args.input)
-    opts = Options(book=args.book, deskew=not args.no_deskew, center=not args.no_center, per_page=args.per_page,
-                   clean_margin=args.clean_margin, upscale=args.upscale, enhance=args.enhance, flatten=args.flatten,
-                   max_angle=args.max_angle, min_angle=args.min_angle or 0.0, dpi=args.dpi, quality=args.quality or 90)
+    center = {} if args.center == args.no_center else {"center": args.center}     # 都没给就按这类书的默认
+    opts = Options.for_book(args.book, deskew=not args.no_deskew, per_page=args.per_page, **center,
+                            clean_margin=args.clean_margin, upscale=args.upscale, enhance=args.enhance, flatten=args.flatten,
+                            max_angle=args.max_angle, min_angle=args.min_angle or 0.0, dpi=args.dpi, quality=args.quality or 90)
     doc = fitz.open(args.input)
     indices = parse_pages(args.pages, doc.page_count)
 

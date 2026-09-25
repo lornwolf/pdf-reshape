@@ -36,6 +36,7 @@ NUDGE_STEP = 0.002        # 版心边框每按一次移动页面宽（高）的 
 ESTIMATE_DELAY = 800      # 设置变了之后等这么久（毫秒）再重新预估输出大小
 NUDGE_ESTIMATE_DELAY = 2000   # 调版心边框时等得更久：停手 2 秒之后才重新预估
 EDGES = {"上": 1, "下": 3, "左": 0, "右": 2}       # 边 → 版心 (左, 上, 右, 下) 里的下标
+BTN_PAD = 1               # 工具栏里按钮两侧的留白：所有按钮之间的间距统一按最窄的（箭头）来（用户要求）
 
 
 class App(tk.Tk):
@@ -74,7 +75,7 @@ class App(tk.Tk):
         self.sr = set()                    # 用户指定「高清化」的页（Real-ESRGAN 放大）
         self.keystone_edit = None          # 正在编辑的梯形校正：(页序, [[x, y] × 4])，None = 没在编辑
         self.keystone_drag = None          # 正拖着四边形的第几个角
-        self.shift = {}                    # 用户指定的平移量 {页序: (dx, dy)}：「版心：…」按钮、手动调整的结果
+        self.shift = {}                    # 用户指定的平移量 {页序: (dx, dy)}：「版心移动：…」按钮、手动调整的结果
         self.confirmed = set()             # 用户点过「确认完毕」的页（滚动条上不再标黄）
         self.notable = set()               # 版心明显偏窄/偏矮、值得看一眼的页（core.notable_pages）
         self.manual_move = False           # 「手动调整」模式：方向键、鼠标拖动移动版心
@@ -149,7 +150,7 @@ class App(tk.Tk):
                                      width=8, state="readonly")
         self.book_box.pack(side="left")
         lock(self.book_box)
-        self.book_box.bind("<<ComboboxSelected>>", lambda e: self.var_book.set(
+        self.book_box.bind("<<ComboboxSelected>>", lambda e: self.select_book_type(
             next(k for k, v in core.BOOK_TYPES.items() if v == self.var_book_label.get())))
         self.var_book.trace_add("write", lambda *_: self.apply_book_type())
 
@@ -236,18 +237,18 @@ class App(tk.Tk):
         ttk.Button(nav, text="▶", width=3, command=lambda: self.step_page(1)).pack(side="left", padx=4)
         self.var_guides = tk.BooleanVar(value=True)
         ttk.Checkbutton(nav, text="辅助线", variable=self.var_guides,
-                        command=self.draw_preview).pack(side="left", padx=12)
+                        command=self.draw_preview).pack(side="left", padx=(12, BTN_PAD))
         # 按下＝当前页不做修正、原样保留；再按一次恢复。只影响当前页
         self.var_skip = tk.BooleanVar(value=False)      # 当前页是不是「不纠偏居中」（按钮的文字跟着它变）
         self.btn_skip = ttk.Button(nav, text="本页不纠偏居中", command=self.toggle_skip, state="disabled")
-        self.btn_skip.pack(side="left", padx=4)
+        self.btn_skip.pack(side="left", padx=BTN_PAD)
         # 删除当前页：新 PDF 中不输出这一页（原文件不动）。按下后变成「恢复当前页」
         style = ttk.Style(self)
         style.configure("Delete.TButton", foreground="#d00000")
         style.configure("Restore.TButton", foreground="#1a7f37")
         self.btn_delete = ttk.Button(nav, text="删除当前页", style="Delete.TButton",
                                      command=self.toggle_delete, state="disabled")
-        self.btn_delete.pack(side="left", padx=4)
+        self.btn_delete.pack(side="left", padx=BTN_PAD)
         self.lbl_skipped = ttk.Label(nav, text="", foreground="#666")
         self.lbl_skipped.pack(side="left", padx=4)
         self.lbl_page_status = ttk.Label(nav, text="", foreground="#0a58ca")
@@ -260,10 +261,11 @@ class App(tk.Tk):
         group = lambda: ttk.Frame(edge_bar, relief="groove", borderwidth=1, padding=(3, 2))
         nudge_group = self.nudge_group = group()
         nudge_group.pack(side="left")
-        ttk.Label(nudge_group, text="版心边框").pack(side="left", padx=(2, 0))
+        ttk.Label(nudge_group, text="版心边框：").pack(side="left", padx=(2, 0))
         self.var_edge = tk.StringVar(value="上")
-        edge_box = ttk.Combobox(nudge_group, textvariable=self.var_edge, values=list(EDGES), width=4, state="readonly")
-        edge_box.pack(side="left", padx=(6, 8))
+        # 下拉框里只有一个汉字（上/下/左/右），宽度刚好放下一个字就行（用户要求）
+        edge_box = ttk.Combobox(nudge_group, textvariable=self.var_edge, values=list(EDGES), width=2, state="readonly")
+        edge_box.pack(side="left", padx=(4, BTN_PAD))
         edge_box.bind("<<ComboboxSelected>>", lambda e: self.update_nudge_buttons())
         self.nudge_buttons = {}
         # 按钮上画三角形：↑↓ 这两个字符会被 Windows 固定换成彩色的表情符号，和 ←→ 不一致。
@@ -272,62 +274,70 @@ class App(tk.Tk):
         for arrow, delta in (("↑", -1), ("↓", 1), ("←", -1), ("→", 1)):
             btn = ttk.Button(nudge_group, text=glyphs[arrow], width=3, state="disabled",
                              command=lambda d=delta: self.nudge(d))
-            btn.pack(side="left", padx=1)
+            btn.pack(side="left", padx=BTN_PAD)
             btn.bind("<ButtonPress-1>", lambda e, d=delta: self.start_repeat(e.widget, d))
             btn.bind("<ButtonRelease-1>", lambda e: self.stop_repeat())
             self.nudge_buttons[arrow] = btn
         self.repeat_after_id = None        # 按住箭头连续调的计时器
         self.repeated = False              # 这次按住期间已经连续调过（松手时不再算一次点击）
         self.btn_nudge_reset = ttk.Button(nudge_group, text="复位", width=5, command=self.reset_nudge, state="disabled")
-        self.btn_nudge_reset.pack(side="left", padx=(8, 2))
-        # 版心的对齐（文字书）：调红框本身不移动页面，按这几个按钮才按现在的红框对齐——靠边的贴全书标准版心的边，
+        self.btn_nudge_reset.pack(side="left", padx=BTN_PAD)
+        # 红框照邻页的来：当前页的红框判断得不好、邻页的好时用。结果记成手动微调，可以再调、可以复位
+        like_group = self.like_group = group()
+        like_group.pack(side="left")
+        self.btn_like_prev = ttk.Button(like_group, text="与前页相同", state="disabled",
+                                        command=lambda: self.copy_neighbor_box(-1))
+        self.btn_like_prev.pack(side="left", padx=BTN_PAD)
+        self.btn_like_next = ttk.Button(like_group, text="与后页相同", state="disabled",
+                                        command=lambda: self.copy_neighbor_box(1))
+        self.btn_like_next.pack(side="left", padx=BTN_PAD)
+        # 版心的移动（文字书）：调红框本身不移动页面，按这几个按钮才按现在的红框对齐——靠边的贴全书标准版心的边，
         # 居中的红框放正中。「手动调整」按下后方向键、鼠标拖动都能移动版心。「复位」把红框微调和对齐一起撤销
-        # 第二排放得下就放第二排（最大化时），放不下（窗口小）挪到第三排：所以它的父级是 right，用 pack(in_=...) 在两排之间挪
+        # 第二排放得下就放第二排（最大化时），紧挨在「与后页相同」右边（用户要求）；放不下（窗口小）挪到第三排：
+        # 所以它的父级是 right，用 pack(in_=...) 在两排之间挪
         self.edge_bar = edge_bar
         self.align_bar = ttk.Frame(right)
         self.align_bar.pack(fill="x", pady=(4, 0))
         self.align_group = ttk.Frame(right, relief="groove", borderwidth=1, padding=(3, 2))
         self.align_group.pack(in_=self.align_bar, side="left")
         self.align_row = "third"
-        ttk.Label(self.align_group, text="版心：").pack(side="left", padx=(2, 4))
+        ttk.Label(self.align_group, text="版心移动").pack(side="left", padx=(2, 4))
         self.align_buttons = {}
         for mode, text in (("left", "靠左"), ("top", "靠上"), ("center", "居中"), ("right", "靠右"), ("bottom", "靠下")):
             btn = ttk.Button(self.align_group, text=text, width=5, state="disabled", command=lambda m=mode: self.align_page(m))
-            btn.pack(side="left", padx=1)
+            btn.pack(side="left", padx=BTN_PAD)
             self.align_buttons[mode] = btn
         self.btn_manual = ttk.Button(self.align_group, text="手动调整", width=9, state="disabled", command=self.toggle_manual_move)
-        self.btn_manual.pack(side="left", padx=(6, 2))
+        self.btn_manual.pack(side="left", padx=BTN_PAD)
         # 确认完毕（绿）：版心明显偏窄、滚动条上标黄的页看过、调好了；按下后变灰。撤销修正（红）：清掉对这一页版心的修正
         style.configure("Confirm.TButton", foreground="#1a7f37")
         self.btn_confirm = ttk.Button(self.align_group, text="确认完毕", width=9, style="Confirm.TButton",
                                       state="disabled", command=self.confirm_page)
-        self.btn_confirm.pack(side="left", padx=(8, 2))
+        self.btn_confirm.pack(side="left", padx=BTN_PAD)
+        # 下一处 / 上一处：翻到滚动条上下一个（上一个）还没确认的黄标页，省得在滚动条上找（到头了从另一头接着找）
+        self.btn_next_mark = ttk.Button(self.align_group, text="下一处", width=6, state="disabled",
+                                        command=lambda: self.goto_mark(1))
+        self.btn_next_mark.pack(side="left", padx=BTN_PAD)
+        self.btn_prev_mark = ttk.Button(self.align_group, text="上一处", width=6, state="disabled",
+                                        command=lambda: self.goto_mark(-1))
+        self.btn_prev_mark.pack(side="left", padx=BTN_PAD)
         self.btn_undo = ttk.Button(self.align_group, text="撤销修正", width=9, style="Delete.TButton",
                                    state="disabled", command=self.undo_page)
-        self.btn_undo.pack(side="left", padx=2)
+        self.btn_undo.pack(side="left", padx=BTN_PAD)
         right.bind("<Configure>", lambda e: self.after_idle(self.relayout_align))
-        # 红框照邻页的来：当前页的红框判断得不好、邻页的好时用。结果记成手动微调，可以再调、可以复位
-        like_group = group()
-        like_group.pack(side="left")
-        self.btn_like_prev = ttk.Button(like_group, text="与前页相同", state="disabled",
-                                        command=lambda: self.copy_neighbor_box(-1))
-        self.btn_like_prev.pack(side="left", padx=(2, 2))
-        self.btn_like_next = ttk.Button(like_group, text="与后页相同", state="disabled",
-                                        command=lambda: self.copy_neighbor_box(1))
-        self.btn_like_next.pack(side="left", padx=(2, 2))
         # 去除边缘污染：把红框外疑似墨迹的地方按周围干净的纸面重新画上。逐页的开关。
         # 梯形校正：按下后在「处理前」一侧画出红色四边形（自动判断的版心，四个角可拖），按钮变成
         # 「执行校正」；再按就把四边形围成的区域铺满整页。校正过的页旁边多一个「取消校正」
         fix_group = group()
         fix_group.pack(side="left", padx=(6, 0))
         self.btn_cleanup = ttk.Button(fix_group, text="去除边缘污染", state="disabled", command=self.toggle_cleanup)
-        self.btn_cleanup.pack(side="left", padx=(2, 6))
+        self.btn_cleanup.pack(side="left", padx=BTN_PAD)
         self.btn_keystone = ttk.Button(fix_group, text="梯形校正", command=self.toggle_keystone, state="disabled")
-        self.btn_keystone.pack(side="left", padx=(2, 2))
+        self.btn_keystone.pack(side="left", padx=BTN_PAD)
         self.btn_keystone_cancel = ttk.Button(fix_group, text="取消校正", command=self.cancel_keystone)
         # 高清化：逐页的开关，交给外部程序 realesrgan-ncnn-vulkan 做 AI 放大（一页约 1～5 分钟）
         self.btn_sr = ttk.Button(fix_group, text="高清化", state="disabled", command=self.toggle_sr)
-        self.btn_sr.pack(side="left", padx=(8, 2))
+        self.btn_sr.pack(side="left", padx=BTN_PAD)
         self.lbl_nudge = ttk.Label(right, text="", foreground="#666")      # 父级是 right：跟着对齐组在两排之间挪
         self.lbl_nudge.pack(in_=self.align_bar, side="left", padx=8)
 
@@ -392,6 +402,17 @@ class App(tk.Tk):
             min_angle=max(num(self.var_min_angle, 0.1, float), 0.0),
             dpi=min(max(num(self.var_dpi, 300, int), 72), 1200),
             quality=min(max(num(self.var_quality, 90, int), 1), 100)).effective()   # 藏起来的选项一律按关闭
+
+    def select_book_type(self, book):
+        """用户在下拉框里换了书的类型：和 Options 默认值不同的选项按这类书的默认来（漫画默认不勾「版心居中」，
+        用户定的）。只在用户换类型时做——打开有记录的书时恢复的是它自己保存的设置，不能被盖掉。"""
+        if book == self.var_book.get():
+            return
+        defaults = core.Options.for_book(book)
+        for name in set(core.BOOK_DEFAULTS.get(book, {})) | set(core.BOOK_DEFAULTS.get(self.var_book.get(), {})):
+            var_name = {"clean_margin": "clean"}.get(name, name)
+            getattr(self, "var_" + var_name).set(getattr(defaults, name))
+        self.var_book.set(book)
 
     def apply_book_type(self):
         """按书的类型显示对应的「修正内容」选项；建议值的提示也跟着换。藏起来的勾选框可能还勾着，
@@ -626,7 +647,7 @@ class App(tk.Tk):
         if usable and (editing or index in self.keystone):
             self.btn_keystone_cancel.configure(text="取消校正")
             if not self.btn_keystone_cancel.winfo_manager():
-                self.btn_keystone_cancel.pack(side="left", padx=(2, 2), after=self.btn_keystone)
+                self.btn_keystone_cancel.pack(side="left", padx=BTN_PAD, after=self.btn_keystone)
         else:
             self.btn_keystone_cancel.pack_forget()
 
@@ -728,6 +749,10 @@ class App(tk.Tk):
                                   text="结束手动调整" if self.manual_move else "手动调整")
         self.btn_confirm.configure(state="normal" if text_book and ready and index in self.notable and index not in self.confirmed
                                    else "disabled")
+        # 除了当前页还有别的黄标页才有地方可去
+        elsewhere = bool((self.notable - self.confirmed) - {index})
+        for btn in (self.btn_next_mark, self.btn_prev_mark):
+            btn.configure(state="normal" if text_book and ready and elsewhere else "disabled")
         self.btn_undo.configure(state="normal" if text_book and ready and (offsets or fixed or index in self.confirmed) else "disabled")
         # 这一行只放操作提示，不念叨这一页改了什么（曾显示「本页已微调: …」「版心位置已指定: …」，用户不要）；
         # 有没有改过看「撤销修正」亮不亮
@@ -787,7 +812,7 @@ class App(tk.Tk):
         return core.compute_shift(self.infos[index], self.ref, False, self.var_book.get())
 
     def align_page(self, mode):
-        """「版心：靠左/靠上/居中/靠右/靠下」：按现在的红框（含微调）算平移量并记下来。
+        """「版心移动：靠左/靠上/居中/靠右/靠下」：按现在的红框（含微调）算平移量并记下来。
         靠边贴的是全书标准版心的边（standard_edges），另一个方向保持现在的位置。"""
         if not self.adjust_ready() or not self.page_count:
             return
@@ -837,6 +862,22 @@ class App(tk.Tk):
         self.update_nudge_buttons()
         self.draw_scrollbar()
 
+    def goto_mark(self, direction):
+        """「下一处 / 上一处」：翻到滚动条上下一个（上一个）还没确认的黄标页；到头了从另一头接着找。
+        确认完一页接着按「下一处」，就能顺着把黄标的页过一遍。"""
+        pending = sorted(self.notable - self.confirmed)
+        if not pending or not self.adjust_ready():
+            return
+        index = self.current_index()
+        if direction > 0:
+            target = next((i for i in pending if i > index), pending[0])
+        else:
+            target = next((i for i in reversed(pending) if i < index), pending[-1])
+        if target == index:
+            return
+        self.var_page.set(target + 1)
+        self.schedule_preview()             # request_preview 会重画滚动条、更新按钮
+
     def undo_page(self):
         """「撤销修正」：清掉这一页对版心的修正（红框微调、指定的位置），确认过的也退回未确认。"""
         index = self.current_index()
@@ -849,8 +890,8 @@ class App(tk.Tk):
         self.draw_scrollbar()
 
     def relayout_align(self):
-        """「版心：…」那一组放第二排还是第三排：第二排剩下的地方放得下就放第二排（最大化时），否则第三排。
-        第三排只在用到时才存在——放到第二排就整排收起来，把地方留给预览（用户要的正是这个）；漫画书没有这一组，也收起来。"""
+        """「版心移动」那一组放第二排还是第三排：第二排剩下的地方放得下就放第二排（最大化时，紧挨「与后页相同」右边），
+        否则第三排。第三排只在用到时才存在——放到第二排就整排收起来，把地方留给预览（用户要的正是这个）；漫画书没有这一组，也收起来。"""
         if not hasattr(self, "align_group"):
             return
         text_book = self.var_book.get() == "text"
@@ -864,7 +905,7 @@ class App(tk.Tk):
             self.lbl_nudge.pack_forget()
             if row == "second":
                 if text_book:
-                    self.align_group.pack(in_=self.edge_bar, side="left", padx=(6, 0))
+                    self.align_group.pack(in_=self.edge_bar, side="left", padx=(6, 0), after=self.like_group)
                 self.lbl_nudge.pack(in_=self.edge_bar, side="left", padx=8)
                 self.align_bar.pack_forget()
             else:

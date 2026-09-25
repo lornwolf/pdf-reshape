@@ -57,7 +57,7 @@ def test_horizontal():
         f.close(m["angle"], 0, 0.11, f"第 {i} 页的残余倾斜")
         f.close(m["left"], m["right"], 0.02, f"第 {i} 页左右边距")
         f.close(m["top"], m["bottom"], 0.01, f"第 {i} 页上下边距")      # 文字书一律居中，章末半页（第 6 页）也是
-    # 第 6 页是章末半页：默认也居中（用户要求统一居中）；要贴上边由用户按「版心：靠上」，等价于指定平移量
+    # 第 6 页是章末半页：默认也居中（用户要求统一居中）；要贴上边由用户按「版心移动：靠上」，等价于指定平移量
     ref["shift"] = {5: (0.0, ref["boxes"][2][1] - ref["boxes"][5][1] + (1 - ref["ext"][1]) / 2 - ref["boxes"][2][1])}
     out2 = work_path("core_h_top_out.pdf")
     pr.process_document(doc, infos, opts, out2, ref=ref)
@@ -76,6 +76,44 @@ def test_vertical():
         f.close(m["angle"], 0, 0.11, f"第 {i} 页的残余倾斜")
         f.close(m["left"], m["right"], 0.01, f"第 {i} 页左右边距")
         f.close(m["top"], m["bottom"], 0.01, f"第 {i} 页上下边距")
+    return f
+
+
+def test_manga_frame_guards_skew():
+    """漫画的矩形分格框把关倾斜检测：斜着的分格线、密排线在投影上出很尖的峰，把整页转歪
+    （《スラムダンク 第27巻》第 13 页被转了 -3.95°）；框贴着扫描图的边时 make_ink_mask 还会把框整个去掉。"""
+    import math
+    f = Failures()
+    w, h = 1240, 1754
+    img = np.full((h, w), 235, np.uint8)
+    cv2.rectangle(img, (60, 120), (w - 1, 820), 0, 4)          # 两个格子，外框贴着右边（扫描裁得紧）
+    cv2.rectangle(img, (60, 900), (w - 1, 1650), 0, 4)
+    tan = math.tan(math.radians(4))
+    for y0, y1 in ((160, 780), (940, 1610)):                   # 格子里斜 4° 的密排线
+        for y in range(y0, y1, 7):
+            cv2.line(img, (100, y), (w - 40, int(y + (w - 140) * tan)), 0, 2)
+    scale = pr.ANALYSIS_LONG_SIDE / h
+    small = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    ink, frame = pr.make_ink_mask(small), pr.frame_ink(small)
+    alone = pr.detect_skew(ink, 5.0)[0]
+    guarded = pr.detect_skew(ink, 5.0, frame)[0]
+    f.check(abs(alone) > 3, f"只看投影应被排线带偏到 ±4° 附近（否则这个测试测不到把关），实际 {alone}")
+    f.close(guarded, 0.0, 0.11, "有分格框把关时应测出 0°")
+    angles = np.arange(-5, 5.01, 0.5)
+    scores = pr.frame_scores(frame, angles)
+    f.check(scores[10] >= pr.FRAME_MIN_STRENGTH and scores[18] == 0,
+            f"分格框的证据应在 0° 很强、在 4° 没有，实际 0°: {scores[10]:.2f}  4°: {scores[18]:.2f}")
+    # 文字页没有框：把关不改变投影法的结果
+    doc = fitz.open(fixtures()["h.pdf"])
+    for index in (0, 2, 4):
+        info = pr.PageInfo(index=index)
+        info.mode, info.xref = pr.classify_page(doc, doc[index])
+        gray = pr.to_gray(pr.load_page_image(doc, doc[index], info, 300))
+        s = pr.ANALYSIS_LONG_SIDE / max(gray.shape)
+        small = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+        ink = pr.make_ink_mask(small, info.scan_rect)
+        a, b = pr.detect_skew(ink, 5.0)[0], pr.detect_skew(ink, 5.0, pr.frame_ink(small, info.scan_rect))[0]
+        f.check(a == b, f"文字页第 {index + 1} 页的倾斜角不应因把关而变：{a} → {b}")
     return f
 
 
@@ -215,7 +253,7 @@ def test_box_adjust_and_neighbor():
     plain = pr.compute_shift(infos[2], pr.compute_reference(infos), False)
     f.check(pr.compute_shift(infos[2], ref, False) == plain, "只调了红框，平移量不应变")
     f.close(plain[0], (1 - 0.75) / 2 - 0.10, 1e-6, "文字书默认：自动版心居中")
-    # 用户按了「版心：…」或手动调整：平移量直接记在 ref["shift"] 里，之后再调红框也不变
+    # 用户按了「版心移动：…」或手动调整：平移量直接记在 ref["shift"] 里，之后再调红框也不变
     ref["shift"] = {2: (0.03, -0.01)}
     f.check(pr.compute_shift(infos[2], ref, False) == (0.03, -0.01), "指定过的平移量应原样使用")
     ref["adjust"] = {2: (-0.06, 0.0, 0.0, 0.0)}
@@ -502,6 +540,53 @@ def test_color_cover_is_left_alone_in_text_books():
     src, got = page_array(fixtures()["cover.pdf"], 0), page_array(out, 0)
     f.check(np.abs(src.astype(int) - got.astype(int)).mean() < 1, "原样保留的封面输出应和原来一样")
     f.close(measure(out)[2]["angle"], 0, 0.11, "文字页照常纠偏")
+    return f
+
+
+def test_full_bleed_pages_follow_the_book_type():
+    """内容占满整页的页：文字书里当整页图片原样保留；漫画照常纠偏、可高清化（曾一律记成「原样复制」，
+    《スラムダンク 第27巻》四成的页因此既不纠偏也不能高清化）；两种书里都不参与标准版心的统计。"""
+    from make_test import make_manga_page, H, W
+    import random
+    f = Failures()
+    rng = random.Random(5)
+    infos = []
+    for k in range(4):                                          # 3 页普通的漫画页 + 1 页出血到纸边的
+        if k < 3:
+            img = make_manga_page(rng, None)
+        else:
+            img = np.full((H, W), 235, np.uint8)
+            for y in range(16, H - 30, 20):                     # 小方块铺满整页（离纸边不到 1.5%）：不是细线、不是孤立污点
+                for x in range(16, W - 30, 20):
+                    img[y:y + 14, x:x + 14] = 30
+            img = cv2.warpAffine(img, cv2.getRotationMatrix2D((W / 2, H / 2), 1.0, 1.0), (W, H), borderValue=235)
+        info = pr.PageInfo(index=k, mode="native")
+        pr.analyze(img, info, 5.0)
+        infos.append(info)
+    bleed = infos[3]
+    f.check(bleed.full_bleed and bleed.bbox is not None and bleed.mode != "copy" and not any(p.full_bleed for p in infos[:3]),
+            f"只有第 4 页应标为内容占满整页、并保留分析结果，实际 {[p.full_bleed for p in infos]} {bleed.mode}")
+    f.close(bleed.angle, -1.0, 0.15, "出血页的倾斜角照常检测")
+    ref = pr.compute_reference(infos)
+    normal = pr.compute_reference(infos[:3])
+    f.check(ref["ext"] == normal["ext"] and 3 in ref["boxes"], "标准版心应只按普通页统计，出血页仍有自己的版心")
+    text, manga = pr.Options(book="text"), pr.Options(book="manga")
+    plan = pr.plan_page(bleed, ref, text)
+    f.check(plan[2] and "内容占满整页" in plan[3], f"文字书：应原样保留，实际 {plan}")
+    plan = pr.plan_page(bleed, ref, manga)
+    f.check(not plan[2] and abs(plan[0] + 1.0) < 0.15, f"漫画书：应照常纠偏，实际 {plan}")
+    ref["sr"] = {3}
+    f.check(pr.sr_of(bleed, ref) and not pr.plan_page(bleed, ref, text)[2], "两种书里都能高清化（文字书里位置不动）")
+    # 出血页的倾斜置信度不高就不转：整页画面没有文字行和分格框，投影法常常错得离谱（真书里 1°～5° 的全是正的页）
+    original = pr.detect_skew
+    pr.detect_skew = lambda ink, max_angle, frame=None: (3.0, pr.FULL_BLEED_MIN_CONF - 1, False)
+    try:
+        doubtful = pr.PageInfo(index=4, mode="native")
+        pr.analyze(img, doubtful, 5.0)
+    finally:
+        pr.detect_skew = original
+    f.check(doubtful.full_bleed and doubtful.angle == 0.0 and "不旋转" in doubtful.note and doubtful.bbox is not None,
+            f"置信度不够的出血页应不旋转、仍保留版心，实际 {doubtful.angle} {doubtful.note}")
     return f
 
 

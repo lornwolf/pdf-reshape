@@ -122,7 +122,7 @@ def marks(d):
     d.check(app.adjust == {2: (-0.02, 0.0, 0.0, 0.0)}, f"左边框左移 10 步应为 -2%，实际 {app.adjust}")
     yield d.previewed
     d.check(d.status() == old_status, f"只调红框不应移动页面，状态应不变，实际: {d.status()}")
-    d.click(app.align_buttons["center"])                        # 按「版心：居中」才按新的红框对齐
+    d.click(app.align_buttons["center"])                        # 按「版心移动：居中」才按新的红框对齐
     d.check(2 in app.shift, "居中之后应记下这一页的平移量")
     yield d.previewed
     d.check("x-2.8%" in d.status(), f"「居中」后应按新的红框重新居中（x-3.8% → x-2.8%），实际: {d.status()}")
@@ -530,14 +530,26 @@ def align(d):
     d.click(app.btn_nudge_reset)
     d.check(2 not in app.shift, "复位应清掉指定的平移量")
 
-    d.goto(6)                                                   # 黄标的页：确认完毕
+    # 「下一处 / 上一处」：翻到下一个（上一个）还没确认的黄标页，到头了从另一头接着找；只剩当前页这一处时不可用
+    d.check(str(app.btn_next_mark.cget("state")) == "normal" and str(app.btn_prev_mark.cget("state")) == "normal",
+            "有黄标页时「下一处」「上一处」可用")
+    d.click(app.btn_next_mark)
     yield d.previewed
+    d.check(app.var_page.get() == 6, f"「下一处」应翻到黄标的第 6 页，实际第 {app.var_page.get()} 页")
     d.check(str(app.btn_confirm.cget("state")) == "normal", "翻到黄标的页「确认完毕」可用")
+    d.check(str(app.btn_next_mark.cget("state")) == "disabled" and str(app.btn_prev_mark.cget("state")) == "disabled",
+            "没有别的黄标页时「下一处」「上一处」不可用")
+    d.goto(8)
+    yield d.previewed
+    d.click(app.btn_prev_mark)
+    yield d.previewed
+    d.check(app.var_page.get() == 6, f"「上一处」应翻回第 6 页，实际第 {app.var_page.get()} 页")
     marks = len(app.scroll.find_all())
     d.click(app.align_buttons["top"])
     d.click(app.btn_confirm)
     d.check(5 in app.confirmed and str(app.btn_confirm.cget("state")) == "disabled" and len(app.scroll.find_all()) == marks - 1,
             "确认后按钮变灰、滚动条上少一个黄标")
+    d.check(str(app.btn_next_mark.cget("state")) == "disabled", "全部确认之后「下一处」不可用")
     d.check(app.lbl_nudge.cget("text") == "", "提示行不显示「版心位置已指定」之类的文字")
     d.check(app.store.flagged_pages(app.book["id"], "confirmed") == {5}, "确认应保存进数据库")
     d.click(app.btn_undo)
@@ -545,6 +557,16 @@ def align(d):
             and len(app.scroll.find_all()) == marks, "「撤销修正」应清掉指定的位置、退回未确认、黄标回来")
     app.scroll_to(app.scroll.winfo_height() // 2)               # 拖滚动条翻页
     d.check(app.var_page.get() in (4, 5), f"滚动条中点应翻到第 4～5 页，实际 {app.var_page.get()}")
+
+    state = app.state()                                         # 最大化时这一组放第二排，紧挨在「与后页相同」右边（用户要求）
+    app.state("zoomed")
+    app.update()
+    if app.align_row == "second":                               # 屏幕太窄放不下的话仍在第三排，那就不检查顺序
+        order = app.edge_bar.pack_slaves()
+        d.check(order.index(app.align_group) == order.index(app.like_group) + 1,
+                f"「版心移动」一组应在「与后页相同」右边，实际顺序 {[str(w).rsplit('.', 1)[-1] for w in order]}")
+    app.state(state)
+    app.update()
 
     app.var_book.set("manga")                                   # 漫画：这些都不显示
     app.update()
@@ -664,8 +686,16 @@ def book(d):
     d.open(fixtures()["manga.pdf"], analyze=False)
     d.check(app.var_book.get() == "text" and "enhance" in shown() and "flatten" not in shown(),
             f"默认是文字书，应显示「显示增强」、不显示「纸面找平」，实际 {shown()}")
-    app.var_book.set("manga")
+    d.check(app.var_center.get(), "文字书默认勾「版心居中」")
+    app.select_book_type("manga")                               # 用户在下拉框里换成漫画
     d.check(app.var_book_label.get() == "漫画书", "下拉框的文字应跟着类型变")
+    d.check(not app.var_center.get(), "换成漫画书后「版心居中」默认不勾（用户定的）")
+    app.select_book_type("text")
+    d.check(app.var_center.get(), "换回文字书「版心居中」又勾上")
+    app.var_center.set(False)                                   # 用户自己改过的：没换类型就不动
+    app.select_book_type("text")
+    d.check(not app.var_center.get(), "没换类型不应改动用户的勾选")
+    app.select_book_type("manga")
     d.check("flatten" in shown() and "enhance" not in shown() and "upscale" not in shown(),
             f"漫画书应显示「纸面找平」、不显示黑白页的两项，实际 {shown()}")
     d.check(not d.busy(), "换类型不需要重新分析")
@@ -693,6 +723,7 @@ def book(d):
     d.check(not app.rec_labels["flatten"].winfo_manager() and "纸面找平" not in d.status(),
             "文字书不显示找平的建议，也不做找平")
     app.var_book.set("manga")
+    app.var_center.set(True)                                    # 漫画里用户自己勾上居中：应随书保存、重开时恢复
     out = d.process_to("gui_book_out.pdf")
     yield d.processed
     d.check("纸面找平" in d.log(), "处理日志里应写明找平")
@@ -703,8 +734,8 @@ def book(d):
     yield d.idle
     d.check(app.var_book.get() == "text" and not app.var_flatten.get(), "换一本书应回到默认的类型")
     d.open(fixtures()["manga.pdf"])
-    d.check(app.var_book.get() == "manga" and app.var_flatten.get() and not d.busy(),
-            f"重新打开漫画应恢复它的类型和选项，实际 {app.var_book.get()} {app.var_flatten.get()}")
+    d.check(app.var_book.get() == "manga" and app.var_flatten.get() and app.var_center.get() and not d.busy(),
+            f"重新打开漫画应恢复它的类型和选项（含用户勾上的居中），实际 {app.var_book.get()} {app.var_flatten.get()} {app.var_center.get()}")
 
 
 def prepare_stale(db):
