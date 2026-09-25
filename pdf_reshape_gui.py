@@ -1227,7 +1227,8 @@ class App(tk.Tk):
                 infos = self.store.load_analysis(self.book, (opts.max_angle, opts.dpi))
                 self.write_log(f"已恢复上次的进度（{self.book['updated_at'].replace('T', ' ')}）：选项、"
                                f"第 {self.var_page.get()} 页、不纠偏居中 {len(self.skipped)} 页、删除 {len(self.deleted)} 页、"
-                               f"微调版心 {len(self.adjust)} 页"
+                               f"微调版心 {len(self.adjust)} 页、去污 {len(self.cleanup)} 页、"
+                               f"梯形校正 {len(self.keystone)} 页、高清化 {len(self.sr)} 页"
                                + ("、全书分析结果。" if infos else "。分析结果需要重新生成。"))
         self.update_skip_label()
         self.btn_reanalyze.pack(fill="x", pady=(6, 0), before=self.btn_run)
